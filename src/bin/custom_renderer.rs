@@ -1,5 +1,4 @@
 use std::{
-    fs,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -13,10 +12,20 @@ use imageproc::{
 };
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 
-const DEFAULT_IMAGE: &str = "HEI1Ts9aIAETw1k.jpg";
 const BASE_W: u32 = 1197;
 const BASE_H: u32 = 907;
 const CLOCK_START_SECONDS: u32 = 2 * 3600 + 3 * 60 + 5;
+const DEFAULT_IMAGE_NAME: &str = "HEI1Ts9aIAETw1k.jpg";
+const EMBEDDED_REFERENCE_JPG: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/HEI1Ts9aIAETw1k.jpg"));
+const EMBEDDED_MONO_FONT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/DejaVuSansMono-Bold.ttf"
+));
+const EMBEDDED_NARROW_FONT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/LiberationSansNarrow-Bold.ttf"
+));
 
 const BG: Rgba<u8> = Rgba([6, 9, 8, 255]);
 const PANEL_BG: Rgba<u8> = Rgba([6, 11, 10, 255]);
@@ -28,9 +37,6 @@ const LABEL: Rgba<u8> = Rgba([62, 155, 117, 255]);
 const MUTED: Rgba<u8> = Rgba([18, 60, 49, 255]);
 const VALUE: Rgba<u8> = Rgba([219, 177, 91, 255]);
 const BADGE: Rgba<u8> = Rgba([212, 165, 78, 255]);
-
-const MONO_BOLD: &str = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf";
-const NARROW_BOLD: &str = "/usr/share/fonts/truetype/liberation/LiberationSansNarrow-Bold.ttf";
 
 const PORTRAIT_CROP: CropRect = CropRect {
     x: 0.503,
@@ -137,7 +143,7 @@ const DEPARTMENT_MENU: [MenuEntry; 4] = [
 
 fn main() -> Result<()> {
     let cli = Cli::parse()?;
-    let assets = Assets::load(&cli.image_path)?;
+    let assets = Assets::load(cli.image_path.as_deref())?;
     let layout = Layout::new();
     let state = AppState::default();
 
@@ -152,14 +158,14 @@ fn main() -> Result<()> {
 }
 
 struct Cli {
-    image_path: PathBuf,
+    image_path: Option<PathBuf>,
     screenshot_path: Option<PathBuf>,
     scale: f32,
 }
 
 impl Cli {
     fn parse() -> Result<Self> {
-        let mut image_path = PathBuf::from(DEFAULT_IMAGE);
+        let mut image_path = None;
         let mut screenshot_path = None;
         let mut scale = 1.0f32;
         let mut args = std::env::args().skip(1);
@@ -180,12 +186,12 @@ impl Cli {
                 }
                 "-h" | "--help" => {
                     println!(
-                        "Usage:\n  cargo run -- [image_path]\n  cargo run -- --screenshot out.png [image_path]\n  cargo run -- --scale 0.75"
+                        "Usage:\n  cargo run -- [image_path]\n  cargo run -- --screenshot out.png [image_path]\n  cargo run -- --scale 0.75\n\nWhen no image path is given, the bundled {DEFAULT_IMAGE_NAME} reference is used."
                     );
                     std::process::exit(0);
                 }
                 other if other.starts_with('-') => bail!("unrecognized argument: {other}"),
-                other => image_path = PathBuf::from(other),
+                other => image_path = Some(PathBuf::from(other)),
             }
         }
 
@@ -204,12 +210,11 @@ struct Assets {
 }
 
 impl Assets {
-    fn load(image_path: &Path) -> Result<Self> {
+    fn load(image_path: Option<&Path>) -> Result<Self> {
         Ok(Self {
-            source: image::open(image_path)
-                .with_context(|| format!("failed to open {}", image_path.display()))?,
-            mono: load_font(MONO_BOLD)?,
-            narrow: load_font(NARROW_BOLD)?,
+            source: load_source_image(image_path)?,
+            mono: load_font_bytes(EMBEDDED_MONO_FONT, "bundled mono font")?,
+            narrow: load_font_bytes(EMBEDDED_NARROW_FONT, "bundled narrow font")?,
         })
     }
 }
@@ -445,9 +450,17 @@ impl Layout {
     }
 }
 
-fn load_font(path: &str) -> Result<FontArc> {
-    FontArc::try_from_vec(fs::read(path).with_context(|| format!("failed to read font {path}"))?)
-        .map_err(|_| anyhow::anyhow!("invalid font data at {path}"))
+fn load_source_image(image_path: Option<&Path>) -> Result<DynamicImage> {
+    match image_path {
+        Some(path) => image::open(path)
+            .with_context(|| format!("failed to open {}", path.display())),
+        None => image::load_from_memory(EMBEDDED_REFERENCE_JPG)
+            .context("failed to decode bundled reference image"),
+    }
+}
+
+fn load_font_bytes(bytes: &[u8], label: &str) -> Result<FontArc> {
+    FontArc::try_from_vec(bytes.to_vec()).map_err(|_| anyhow::anyhow!("invalid font data in {label}"))
 }
 
 fn show_window(assets: &Assets, layout: &Layout, scale: f32) -> Result<()> {
@@ -461,7 +474,8 @@ fn show_window(assets: &Assets, layout: &Layout, scale: f32) -> Result<()> {
             resize: true,
             ..WindowOptions::default()
         },
-    )?;
+    )
+    .context("failed to open a GUI window; live mode needs a desktop environment. In headless setups, use `cargo run -- --screenshot out.png`.")?;
     window.set_target_fps(60);
 
     let mut state = AppState::default();
