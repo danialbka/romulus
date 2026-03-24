@@ -45,24 +45,24 @@ const MIN_WIDTH: u16 = 100;
 const MIN_HEIGHT: u16 = 34;
 
 const DEFAULT_IMAGE: &str = "HEI1Ts9aIAETw1k.jpg";
-const DEFAULT_FONT: &str = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf";
-const SCREENSHOT_COLS: u16 = 158;
-const SCREENSHOT_ROWS: u16 = 72;
+const DEFAULT_FONT: &str = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf";
+const SCREENSHOT_COLS: u16 = 100;
+const SCREENSHOT_ROWS: u16 = 45;
 const CELL_WIDTH_PX: u32 = 12;
 const CELL_HEIGHT_PX: u32 = 20;
-const TEXT_SIZE_PX: f32 = 14.0;
+const TEXT_SIZE_PX: f32 = 16.0;
 
 const PORTRAIT_CROP: CropRect = CropRect {
-    x: 0.515,
-    y: 0.16,
-    w: 0.43,
-    h: 0.67,
+    x: 0.503,
+    y: 0.172,
+    w: 0.485,
+    h: 0.648,
 };
 const PRINTS_SOURCE_CROP: CropRect = CropRect {
-    x: 0.54,
-    y: 0.815,
-    w: 0.41,
-    h: 0.115,
+    x: 0.509,
+    y: 0.872,
+    w: 0.466,
+    h: 0.076,
 };
 
 fn main() -> Result<()> {
@@ -197,7 +197,7 @@ impl App {
             return;
         }
 
-        let canvas = centered(area, area.width.saturating_sub(4), area.height.saturating_sub(2));
+        let canvas = centered(area, area.width.saturating_sub(2), area.height.saturating_sub(2));
         let outer = dossier_block();
         frame.render_widget(outer.clone(), canvas);
         let inner = outer.inner(canvas);
@@ -205,8 +205,8 @@ impl App {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(4),
-                Constraint::Length(6),
+                Constraint::Length(3),
+                Constraint::Length(5),
                 Constraint::Min(0),
             ])
             .split(inner);
@@ -219,7 +219,7 @@ impl App {
     fn render_header(&self, frame: &mut ratatui::Frame, area: Rect) {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(38), Constraint::Min(0)])
+            .constraints([Constraint::Length(43), Constraint::Min(0)])
             .split(area);
 
         let left_block = bar_block();
@@ -276,12 +276,12 @@ impl App {
     fn render_status_bar(&self, frame: &mut ratatui::Frame, area: Rect) {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(36)])
+            .constraints([Constraint::Min(0), Constraint::Length(41)])
             .split(area);
 
         let left = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(6)])
+            .constraints([Constraint::Min(0), Constraint::Length(7)])
             .split(columns[0]);
 
         let meta = Text::from(vec![
@@ -379,7 +379,7 @@ impl App {
 
         let dept_gender = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(22), Constraint::Min(0)])
+            .constraints([Constraint::Length(28), Constraint::Min(0)])
             .split(rows[1]);
         self.render_department(frame, dept_gender[0]);
         self.render_gender(frame, dept_gender[1]);
@@ -460,7 +460,7 @@ impl App {
     fn render_media_panel(&self, frame: &mut ratatui::Frame, area: Rect) {
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(11)])
+            .constraints([Constraint::Min(0), Constraint::Length(6)])
             .split(area);
 
         self.render_portrait(frame, rows[0]);
@@ -482,8 +482,8 @@ impl App {
                     inner.height,
                     PHOTO_DIM,
                     PHOTO_BRIGHT,
-                    0.96,
-                    1.32,
+                    0.94,
+                    1.35,
                 )
             })
             .unwrap_or_else(|| missing_art(inner.width, inner.height, &self.image_path));
@@ -566,7 +566,7 @@ impl App {
                         PRINT_DIM,
                         PRINT_BRIGHT,
                         1.0,
-                        2.2,
+                        3.0,
                     )
                 })
                 .unwrap_or_else(|| missing_art(inner.width, inner.height, &self.image_path));
@@ -625,7 +625,7 @@ impl ReferenceArt {
         };
 
         let grayscale = cropped
-            .resize_exact(width as u32 * 2, height as u32 * 2, FilterType::Nearest)
+            .resize_exact(width as u32 * 2, height as u32 * 2, FilterType::CatmullRom)
             .to_luma8();
         let mut lines = Vec::with_capacity(height as usize);
 
@@ -747,7 +747,9 @@ fn render_buffer_png(buffer: &Buffer, output_path: &Path) -> Result<()> {
     let font_bytes = fs::read(DEFAULT_FONT)
         .ok()
         .or_else(|| {
-            fs::read("/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf").ok()
+            fs::read("/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf")
+                .or_else(|_| fs::read("/usr/share/fonts/truetype/liberation2/LiberationMono-Bold.ttf"))
+                .ok()
         })
         .ok_or_eyre("unable to locate a monospace font for screenshot capture")?;
     let font = FontArc::try_from_vec(font_bytes).map_err(|_| eyre!("invalid font data"))?;
@@ -1097,7 +1099,7 @@ fn render_field_row(frame: &mut ratatui::Frame, area: Rect, label: &str, value: 
 }
 
 fn render_separator(frame: &mut ratatui::Frame, area: Rect) {
-    let line = "─".repeat(area.width as usize);
+    let line = "┄".repeat(area.width as usize);
     frame.render_widget(Paragraph::new(Line::styled(line, muted_style())), area);
 }
 
