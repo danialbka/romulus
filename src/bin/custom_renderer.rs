@@ -1,5 +1,6 @@
 use std::{
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -10,11 +11,12 @@ use imageproc::{
     drawing::{draw_filled_rect_mut, draw_hollow_rect_mut, draw_text_mut},
     rect::Rect,
 };
-use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
+use minifb::{InputCallback, Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 
 const BASE_W: u32 = 1197;
 const BASE_H: u32 = 907;
 const CLOCK_START_SECONDS: u32 = 2 * 3600 + 3 * 60 + 5;
+const PORTRAIT_FADE_SECONDS: f32 = 2.4;
 const DEFAULT_IMAGE_NAME: &str = "HEI1Ts9aIAETw1k.jpg";
 const EMBEDDED_REFERENCE_JPG: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/HEI1Ts9aIAETw1k.jpg"));
@@ -211,6 +213,8 @@ impl Cli {
 
 struct Assets {
     source: DynamicImage,
+    portrait: RgbaImage,
+    portrait_crt: RgbaImage,
     mono: FontArc,
     narrow_bold: FontArc,
     narrow_regular: FontArc,
@@ -218,8 +222,13 @@ struct Assets {
 
 impl Assets {
     fn load(image_path: Option<&Path>) -> Result<Self> {
+        let source = load_source_image(image_path)?;
+        let portrait = crop_norm(&source, PORTRAIT_CROP)?.to_rgba8();
+        let portrait_crt = build_crt_portrait(&portrait);
         Ok(Self {
-            source: load_source_image(image_path)?,
+            source,
+            portrait,
+            portrait_crt,
             mono: load_font_bytes(EMBEDDED_MONO_FONT, "bundled mono font")?,
             narrow_bold: load_font_bytes(EMBEDDED_NARROW_BOLD_FONT, "bundled narrow bold font")?,
             narrow_regular: load_font_bytes(EMBEDDED_NARROW_REGULAR_FONT, "bundled narrow regular font")?,
@@ -352,11 +361,110 @@ enum HitTarget {
     Department,
     Gender(Gender),
     Fingerprint(usize),
+    Field(EditableField),
     MenuItem(MenuAction),
     MenuPanel(MenuKind),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditableField {
+    User,
+    Settlement,
+    CitizenId,
+    Name,
+    Resident,
+    DateOfBirth,
+    BirthPlace,
+    Height,
+    Weight,
+    EducationRecords,
+    RelationOne,
+    RelationTwo,
+}
+
+impl EditableField {
+    const ORDER: [Self; 12] = [
+        Self::User,
+        Self::Settlement,
+        Self::CitizenId,
+        Self::Name,
+        Self::Resident,
+        Self::DateOfBirth,
+        Self::BirthPlace,
+        Self::Height,
+        Self::Weight,
+        Self::EducationRecords,
+        Self::RelationOne,
+        Self::RelationTwo,
+    ];
+
+    fn next(self) -> Self {
+        let idx = Self::ORDER.iter().position(|field| *field == self).unwrap_or(0);
+        Self::ORDER[(idx + 1) % Self::ORDER.len()]
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TextSelection {
+    field: EditableField,
+    anchor: usize,
+    caret: usize,
+}
+
+impl TextSelection {
+    fn sorted(&self) -> (usize, usize) {
+        if self.anchor <= self.caret {
+            (self.anchor, self.caret)
+        } else {
+            (self.caret, self.anchor)
+        }
+    }
+
+    fn collapsed(field: EditableField, index: usize) -> Self {
+        Self {
+            field,
+            anchor: index,
+            caret: index,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DossierData {
+    user: String,
+    settlement: String,
+    citizen_id: String,
+    name: String,
+    resident: String,
+    date_of_birth: String,
+    birth_place: String,
+    height: String,
+    weight: String,
+    education_records: String,
+    relation_one: String,
+    relation_two: String,
+}
+
+impl Default for DossierData {
+    fn default() -> Self {
+        Self {
+            user: "OFFICER AD".to_owned(),
+            settlement: "JACKSON'S STAR COLONY".to_owned(),
+            citizen_id: "FWC25583".to_owned(),
+            name: "MARIE RAINES CARRADINE".to_owned(),
+            resident: "JACKSON'S STAR".to_owned(),
+            date_of_birth: "18 FEBRUARY 2121".to_owned(),
+            birth_place: "EARTH, 21 YRS - AQUARIUS".to_owned(),
+            height: "150 CM".to_owned(),
+            weight: "45 KG".to_owned(),
+            education_records: "N/A".to_owned(),
+            relation_one: "CARRADINE, E (DECEASED)".to_owned(),
+            relation_two: "CARRADINE, S (DECEASED)".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct AppState {
     hover: Option<HitTarget>,
     active_tab: HeaderTab,
@@ -367,7 +475,10 @@ struct AppState {
     badge_mode: BadgeMode,
     selected_print: usize,
     clock_seconds: u32,
+    portrait_progress: f32,
     has_interacted: bool,
+    dossier: DossierData,
+    selection: Option<TextSelection>,
 }
 
 impl Default for AppState {
@@ -382,7 +493,24 @@ impl Default for AppState {
             badge_mode: BadgeMode::AccessA,
             selected_print: 1,
             clock_seconds: 0,
+            portrait_progress: 0.0,
             has_interacted: false,
+            dossier: DossierData::default(),
+            selection: None,
+        }
+    }
+}
+
+struct TextInputBuffer {
+    chars: Arc<Mutex<Vec<char>>>,
+}
+
+impl InputCallback for TextInputBuffer {
+    fn add_char(&mut self, uni_char: u32) {
+        if let Some(ch) = char::from_u32(uni_char) {
+            if !ch.is_control() && let Ok(mut chars) = self.chars.lock() {
+                chars.push(ch);
+            }
         }
     }
 }
@@ -401,6 +529,29 @@ struct Layout {
     gender_boxes: [(Gender, PxRect); 3],
     finger_cells: [PxRect; 5],
     relations_focus: PxRect,
+}
+
+#[derive(Clone, Copy)]
+enum TextAlign {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy)]
+enum FieldFont {
+    Mono,
+    NarrowRegular,
+}
+
+#[derive(Clone, Copy)]
+struct FieldStyle {
+    rect: PxRect,
+    font: FieldFont,
+    size: f32,
+    x_scale: f32,
+    color: Rgba<u8>,
+    align: TextAlign,
+    baseline_y: u32,
 }
 
 impl Layout {
@@ -423,10 +574,10 @@ impl Layout {
         let step = finger.w / 5;
         let finger_cells = std::array::from_fn(|i| {
             PxRect::new(
-                finger.x + i as u32 * step + 7,
-                finger.y + 30,
-                step.saturating_sub(14),
-                finger.h.saturating_sub(40),
+                finger.x + i as u32 * step + 11,
+                finger.y + 20,
+                step.saturating_sub(22),
+                finger.h.saturating_sub(28),
             )
         });
         let relations_focus = PxRect::new(left_panel.x + 14, left_panel.bottom() - 84, left_panel.w - 28, 64);
@@ -458,6 +609,59 @@ impl Layout {
     }
 }
 
+fn field_style(layout: &Layout, field: EditableField) -> FieldStyle {
+    match field {
+        EditableField::User => FieldStyle {
+            rect: PxRect::new(layout.status_left.x + 134, layout.status_left.y + 8, 290, 25),
+            font: FieldFont::NarrowRegular,
+            size: 18.5,
+            x_scale: 0.93,
+            color: VALUE,
+            align: TextAlign::Left,
+            baseline_y: layout.status_left.y + 13,
+        },
+        EditableField::Settlement => FieldStyle {
+            rect: PxRect::new(layout.status_left.x + 134, layout.status_left.y + 32, 340, 25),
+            font: FieldFont::NarrowRegular,
+            size: 18.5,
+            x_scale: 0.93,
+            color: VALUE,
+            align: TextAlign::Left,
+            baseline_y: layout.status_left.y + 37,
+        },
+        EditableField::CitizenId => FieldStyle {
+            rect: PxRect::new(layout.left_panel.x + 206, layout.left_panel.y + 12, layout.left_panel.w - 224, 36),
+            font: FieldFont::Mono,
+            size: 26.0,
+            x_scale: 0.95,
+            color: VALUE,
+            align: TextAlign::Right,
+            baseline_y: layout.left_panel.y + 21,
+        },
+        EditableField::Name => value_row_style(layout.left_panel, layout.left_panel.y + 248, 20.0),
+        EditableField::Resident => value_row_style(layout.left_panel, layout.left_panel.y + 301, 20.0),
+        EditableField::DateOfBirth => value_row_style(layout.left_panel, layout.left_panel.y + 394, 20.0),
+        EditableField::BirthPlace => value_row_style(layout.left_panel, layout.left_panel.y + 447, 20.0),
+        EditableField::Height => value_row_style(layout.left_panel, layout.left_panel.y + 500, 20.0),
+        EditableField::Weight => value_row_style(layout.left_panel, layout.left_panel.y + 553, 20.0),
+        EditableField::EducationRecords => value_row_style(layout.left_panel, layout.left_panel.bottom() - 118, 20.0),
+        EditableField::RelationOne => value_row_style(layout.left_panel, layout.left_panel.bottom() - 62, 20.0),
+        EditableField::RelationTwo => value_row_style(layout.left_panel, layout.left_panel.bottom() - 31, 20.0),
+    }
+}
+
+fn value_row_style(area: PxRect, y: u32, size: f32) -> FieldStyle {
+    FieldStyle {
+        rect: PxRect::new(area.x + 248, y.saturating_sub(4), area.w - 266, 26),
+        font: FieldFont::NarrowRegular,
+        size,
+        x_scale: 1.0,
+        color: VALUE,
+        align: TextAlign::Right,
+        baseline_y: y.saturating_sub(2),
+    }
+}
+
 fn load_source_image(image_path: Option<&Path>) -> Result<DynamicImage> {
     match image_path {
         Some(path) => image::open(path)
@@ -469,6 +673,40 @@ fn load_source_image(image_path: Option<&Path>) -> Result<DynamicImage> {
 
 fn load_font_bytes(bytes: &[u8], label: &str) -> Result<FontArc> {
     FontArc::try_from_vec(bytes.to_vec()).map_err(|_| anyhow::anyhow!("invalid font data in {label}"))
+}
+
+fn dossier_field(data: &DossierData, field: EditableField) -> &str {
+    match field {
+        EditableField::User => &data.user,
+        EditableField::Settlement => &data.settlement,
+        EditableField::CitizenId => &data.citizen_id,
+        EditableField::Name => &data.name,
+        EditableField::Resident => &data.resident,
+        EditableField::DateOfBirth => &data.date_of_birth,
+        EditableField::BirthPlace => &data.birth_place,
+        EditableField::Height => &data.height,
+        EditableField::Weight => &data.weight,
+        EditableField::EducationRecords => &data.education_records,
+        EditableField::RelationOne => &data.relation_one,
+        EditableField::RelationTwo => &data.relation_two,
+    }
+}
+
+fn dossier_field_mut(data: &mut DossierData, field: EditableField) -> &mut String {
+    match field {
+        EditableField::User => &mut data.user,
+        EditableField::Settlement => &mut data.settlement,
+        EditableField::CitizenId => &mut data.citizen_id,
+        EditableField::Name => &mut data.name,
+        EditableField::Resident => &mut data.resident,
+        EditableField::DateOfBirth => &mut data.date_of_birth,
+        EditableField::BirthPlace => &mut data.birth_place,
+        EditableField::Height => &mut data.height,
+        EditableField::Weight => &mut data.weight,
+        EditableField::EducationRecords => &mut data.education_records,
+        EditableField::RelationOne => &mut data.relation_one,
+        EditableField::RelationTwo => &mut data.relation_two,
+    }
 }
 
 fn show_window(assets: &Assets, layout: &Layout, static_frame: &RgbaImage, scale: f32) -> Result<()> {
@@ -485,6 +723,10 @@ fn show_window(assets: &Assets, layout: &Layout, static_frame: &RgbaImage, scale
     )
     .context("failed to open a GUI window; live mode needs a desktop environment. In headless setups, use `cargo run -- --screenshot out.png`.")?;
     window.set_target_fps(60);
+    let text_input = Arc::new(Mutex::new(Vec::new()));
+    window.set_input_callback(Box::new(TextInputBuffer {
+        chars: text_input.clone(),
+    }));
 
     let mut state = AppState::default();
     let mut frame = static_frame.clone();
@@ -492,7 +734,9 @@ fn show_window(assets: &Assets, layout: &Layout, static_frame: &RgbaImage, scale
     let mut last_size = (start_w, start_h);
     let mut mouse_was_down = false;
     let clock_started = Instant::now();
+    let fade_started = Instant::now();
     let mut needs_present = true;
+    let mut drag_selection: Option<(EditableField, usize)> = None;
 
     while window.is_open() && !window.is_key_down(Key::Q) {
         let mut dirty = false;
@@ -502,8 +746,24 @@ fn show_window(assets: &Assets, layout: &Layout, static_frame: &RgbaImage, scale
             dirty = true;
         }
 
+        let next_portrait_progress = (fade_started.elapsed().as_secs_f32() / PORTRAIT_FADE_SECONDS).clamp(0.0, 1.0);
+        if (next_portrait_progress - state.portrait_progress).abs() > 0.002 {
+            state.portrait_progress = next_portrait_progress;
+            dirty = true;
+        }
+
+        if apply_text_input(&mut state, drain_text_input(&text_input)) {
+            dirty = true;
+        }
+        if handle_text_edit_keys(&window, &mut state) {
+            dirty = true;
+        }
+
         if window.is_key_pressed(Key::Escape, KeyRepeat::No) {
-            if state.open_menu.take().is_some() {
+            if state.selection.take().is_some() {
+                drag_selection = None;
+                dirty = true;
+            } else if state.open_menu.take().is_some() {
                 dirty = true;
             } else {
                 break;
@@ -511,12 +771,18 @@ fn show_window(assets: &Assets, layout: &Layout, static_frame: &RgbaImage, scale
         }
 
         if window.is_key_pressed(Key::Tab, KeyRepeat::No) {
-            state.active_tab = match state.active_tab {
-                HeaderTab::Corp => HeaderTab::Database,
-                HeaderTab::Database => HeaderTab::Corp,
-            };
-            state.open_menu = Some(state.active_tab.menu_kind());
-            state.has_interacted = true;
+            if let Some(selection) = state.selection.as_mut() {
+                let next_field = selection.field.next();
+                let next_len = dossier_field(&state.dossier, next_field).chars().count();
+                *selection = TextSelection::collapsed(next_field, next_len);
+            } else {
+                state.active_tab = match state.active_tab {
+                    HeaderTab::Corp => HeaderTab::Database,
+                    HeaderTab::Database => HeaderTab::Corp,
+                };
+                state.open_menu = Some(state.active_tab.menu_kind());
+                state.has_interacted = true;
+            }
             dirty = true;
         }
 
@@ -524,14 +790,10 @@ fn show_window(assets: &Assets, layout: &Layout, static_frame: &RgbaImage, scale
         let window_w = ww.max(1);
         let window_h = hh.max(1);
         let viewport = fit_viewport(window_w, window_h);
-        let hover = window
+        let mouse_canvas = window
             .get_mouse_pos(MouseMode::Pass)
-            .map(|(mx, my)| {
-                map_mouse_to_canvas(mx, my, viewport)
-                    .map(|(x, y)| hit_test(layout, &state, x, y))
-                    .flatten()
-            })
-            .flatten();
+            .and_then(|(mx, my)| map_mouse_to_canvas(mx, my, viewport));
+        let hover = mouse_canvas.and_then(|(x, y)| hit_test(layout, &state, x, y));
 
         if hover != state.hover {
             state.hover = hover;
@@ -539,13 +801,57 @@ fn show_window(assets: &Assets, layout: &Layout, static_frame: &RgbaImage, scale
         }
 
         let mouse_down = window.get_mouse_down(MouseButton::Left);
+        if mouse_down && !mouse_was_down
+            && let Some((x, _y)) = mouse_canvas
+            && let Some(HitTarget::Field(field)) = hover
+        {
+            let index = field_char_index(assets, layout, &state, field, x);
+            state.selection = Some(TextSelection::collapsed(field, index));
+            state.open_menu = None;
+            state.has_interacted = true;
+            drag_selection = Some((field, index));
+            dirty = true;
+        }
+
+        if mouse_down
+            && let Some((field, anchor)) = drag_selection
+            && let Some((x, _y)) = mouse_canvas
+        {
+            let index = field_char_index(assets, layout, &state, field, x);
+            let mut changed = false;
+            match state.selection.as_mut() {
+                Some(selection) if selection.field == field => {
+                    if selection.anchor != anchor || selection.caret != index {
+                        selection.anchor = anchor;
+                        selection.caret = index;
+                        changed = true;
+                    }
+                }
+                _ => {
+                    state.selection = Some(TextSelection {
+                        field,
+                        anchor,
+                        caret: index,
+                    });
+                    changed = true;
+                }
+            }
+            if changed {
+                dirty = true;
+            }
+        }
+
         if !mouse_down && mouse_was_down {
-            if let Some(hit) = state.hover {
-                if handle_click(&mut state, hit) {
+            if drag_selection.take().is_none() {
+                if let Some(hit) = state.hover {
+                    if handle_click(&mut state, hit) {
+                        dirty = true;
+                    }
+                } else if state.open_menu.take().is_some() {
+                    dirty = true;
+                } else if state.selection.take().is_some() {
                     dirty = true;
                 }
-            } else if state.open_menu.take().is_some() {
-                dirty = true;
             }
         }
         mouse_was_down = mouse_down;
@@ -601,7 +907,8 @@ fn render_scene(
     draw_header_dynamic(frame, layout, state, interactive);
     draw_status_dynamic(frame, assets, layout, state, interactive);
     draw_left_panel_dynamic(frame, assets, layout, state, interactive);
-    draw_portrait_panel_dynamic(frame, layout, state, interactive);
+    draw_editable_fields_dynamic(frame, assets, layout, state, interactive);
+    draw_portrait_panel_dynamic(frame, assets, layout, state, interactive);
     draw_fingerprint_panel_dynamic(frame, assets, layout, state, interactive);
 
     if interactive && state.has_interacted {
@@ -628,24 +935,26 @@ fn draw_header_static(
     let logo_area = PxRect::new(layout.header_left.x + 11, layout.header_left.y + 6, 56, 20);
     let logo = crop_norm(&assets.source, LOGO_CROP)?;
     overlay_fit(img, &logo, logo_area);
-    draw_text(
+    draw_text_scaled(
         img,
         &assets.narrow_bold,
-        22.0,
+        21.0,
         VALUE,
-        layout.header_left.x + 71,
-        layout.header_left.y + 5,
+        layout.header_left.x + 70,
+        layout.header_left.y + 6,
         "WEYLAND-YUTANI CORP",
+        0.94,
     );
-    draw_centered_text(
+    draw_centered_text_scaled(
         img,
         &assets.narrow_bold,
-        22.0,
+        21.0,
         VALUE,
         layout.header_center,
-        layout.header_center.y + 5,
+        layout.header_center.y + 6,
         "COLONY AFFAIRS DATABASE",
         0.58,
+        0.94,
     );
 
     Ok(())
@@ -666,17 +975,27 @@ fn draw_header_dynamic(img: &mut RgbaImage, layout: &Layout, state: &AppState, i
 }
 
 fn draw_status_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout) {
-    draw_text(img, &assets.narrow_regular, 18.0, LABEL, layout.status_left.x + 18, layout.status_left.y + 14, "USER:");
-    draw_text(
+    draw_text_scaled(
         img,
-        &assets.narrow_bold,
-        20.0,
-        VALUE,
-        layout.status_left.x + 139,
-        layout.status_left.y + 11,
-        "OFFICER AD",
+        &assets.narrow_regular,
+        18.0,
+        LABEL,
+        layout.status_left.x + 18,
+        layout.status_left.y + 14,
+        "USER:",
+        0.95,
     );
-    draw_text(
+    draw_text_scaled(
+        img,
+        &assets.narrow_regular,
+        18.5,
+        VALUE,
+        layout.status_left.x + 137,
+        layout.status_left.y + 13,
+        "OFFICER AD",
+        0.93,
+    );
+    draw_text_scaled(
         img,
         &assets.narrow_regular,
         18.0,
@@ -684,17 +1003,19 @@ fn draw_status_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout) {
         layout.status_left.x + 18,
         layout.status_left.y + 38,
         "SETTLEMENT:",
+        0.95,
     );
-    draw_text(
+    draw_text_scaled(
         img,
-        &assets.narrow_bold,
-        20.0,
+        &assets.narrow_regular,
+        18.5,
         VALUE,
-        layout.status_left.x + 139,
-        layout.status_left.y + 35,
+        layout.status_left.x + 137,
+        layout.status_left.y + 37,
         "JACKSON'S STAR COLONY",
+        0.93,
     );
-    draw_text(
+    draw_text_scaled(
         img,
         &assets.narrow_regular,
         18.0,
@@ -702,6 +1023,7 @@ fn draw_status_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout) {
         layout.status_right.x + 22,
         layout.status_right.y + 38,
         "LOG_ID",
+        0.95,
     );
 }
 
@@ -712,37 +1034,50 @@ fn draw_status_dynamic(
     state: &AppState,
     interactive: bool,
 ) {
-    let inner = PxRect::new(layout.badge.x + 13, layout.badge.y + 11, layout.badge.w - 26, layout.badge.h - 22);
+    let inner = PxRect::new(layout.badge.x + 12, layout.badge.y + 10, layout.badge.w - 24, layout.badge.h - 20);
     let badge_fill = if interactive && (state.hover == Some(HitTarget::Badge) || state.open_menu == Some(MenuKind::Badge)) {
-        blend(BADGE, VALUE, 0.12)
+        blend(blend(BADGE, PANEL_BG, 0.18), VALUE, 0.08)
     } else {
-        BADGE
+        blend(BADGE, PANEL_BG, 0.18)
     };
     draw_filled_rect_mut(img, Rect::at(inner.x as i32, inner.y as i32).of_size(inner.w, inner.h), badge_fill);
-    draw_centered_text(img, &assets.narrow_bold, 22.0, PANEL_BG, inner, inner.y + 5, state.badge_mode.glyph(), 0.62);
-
-    let clock = format_clock_text(state.clock_seconds);
-    draw_text(
-        img,
-        &assets.narrow_regular,
-        18.0,
-        LABEL,
-        layout.status_right.x + 22,
-        layout.status_right.y + 14,
-        &clock,
-    );
-    draw_text(
+    stroke_rect(img, inner, blend(BADGE, VALUE, 0.12), 1);
+    draw_centered_text_scaled(
         img,
         &assets.narrow_bold,
-        22.5,
+        21.0,
+        blend(PANEL_BG, MUTED, 0.18),
+        inner,
+        inner.y + 8,
+        state.badge_mode.glyph(),
+        0.62,
+        0.9,
+    );
+
+    let clock = format_clock_text(state.clock_seconds);
+    draw_text_scaled(
+        img,
+        &assets.narrow_regular,
+        17.0,
+        LABEL,
+        layout.status_right.x + 22,
+        layout.status_right.y + 15,
+        &clock,
+        0.95,
+    );
+    draw_text_scaled(
+        img,
+        &assets.narrow_bold,
+        21.0,
         VALUE,
-        layout.status_right.x + 188,
-        layout.status_right.y + 10,
+        layout.status_right.x + 182,
+        layout.status_right.y + 11,
         if interactive && state.has_interacted {
             state.badge_mode.status_text()
         } else {
             "SYSTEM ONLINE"
         },
+        0.93,
     );
     if interactive && state.has_interacted {
         let detail = match state.view {
@@ -750,7 +1085,7 @@ fn draw_status_dynamic(
             ViewMode::Biometrics => "BIO-METRIC",
             ViewMode::Relations => "RELATIONS",
         };
-        draw_text(
+        draw_text_scaled(
             img,
             &assets.narrow_regular,
             18.0,
@@ -758,6 +1093,7 @@ fn draw_status_dynamic(
             layout.status_right.x + 102,
             layout.status_right.y + 38,
             detail,
+            0.95,
         );
     }
 }
@@ -765,15 +1101,16 @@ fn draw_status_dynamic(
 fn draw_left_panel_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout) {
     let area = layout.left_panel;
     draw_text(img, &assets.narrow_regular, 18.0, LABEL, area.x + 20, area.y + 34, "CITIZEN ID:");
-    draw_right_text(
+    draw_right_text_scaled(
         img,
         &assets.mono,
-        27.0,
+        26.0,
         VALUE,
-        area.right() - 20,
-        area.y + 20,
+        area.right() - 24,
+        area.y + 21,
         "FWC25583",
         0.58,
+        0.95,
     );
     draw_text(img, &assets.mono, 28.0, MUTED, area.x + 8, area.y + 168, ">");
     draw_text(img, &assets.mono, 28.0, MUTED, area.x + 8, area.y + 196, ">");
@@ -885,10 +1222,10 @@ fn draw_left_panel_dynamic(
     draw_text(
         img,
         &assets.narrow_bold,
-        20.0,
+        19.0,
         VALUE,
         layout.dept.x + 92,
-        layout.dept.y + 7,
+        layout.dept.y + 8,
         state.department.label(),
     );
 
@@ -921,20 +1258,97 @@ fn draw_left_panel_dynamic(
     }
 }
 
+fn draw_editable_fields_dynamic(
+    img: &mut RgbaImage,
+    assets: &Assets,
+    layout: &Layout,
+    state: &AppState,
+    interactive: bool,
+) {
+    for field in EditableField::ORDER {
+        let style = field_style(layout, field);
+        let is_hovered = interactive && state.hover == Some(HitTarget::Field(field));
+        let is_active = state.selection.as_ref().map(|selection| selection.field) == Some(field);
+        let fill = if is_active {
+            blend(PANEL_BG, HEADER_BG, 0.08)
+        } else {
+            PANEL_BG
+        };
+        draw_filled_rect_mut(img, Rect::at(style.rect.x as i32, style.rect.y as i32).of_size(style.rect.w, style.rect.h), fill);
+        draw_editable_text_value(img, assets, state, style, field);
+        if is_active {
+            stroke_rect(img, style.rect, BADGE, 1);
+        } else if is_hovered {
+            stroke_rect(img, style.rect, blend(BORDER, VALUE, 0.25), 1);
+        }
+    }
+}
+
+fn draw_editable_text_value(
+    img: &mut RgbaImage,
+    assets: &Assets,
+    state: &AppState,
+    style: FieldStyle,
+    field: EditableField,
+) {
+    let font = resolve_field_font(assets, style.font);
+    let text = dossier_field(&state.dossier, field);
+    let text_width = estimate_text_width_scaled(font, text, style.size, 1.0, style.x_scale);
+    let text_x = match style.align {
+        TextAlign::Left => style.rect.x,
+        TextAlign::Right => style.rect.right().saturating_sub(text_width),
+    };
+
+    if let Some(selection) = state.selection.as_ref().filter(|selection| selection.field == field) {
+        draw_selection_highlight(img, font, style, text, selection, text_x);
+    }
+
+    draw_text_scaled(
+        img,
+        font,
+        style.size,
+        style.color,
+        text_x,
+        style.baseline_y,
+        text,
+        style.x_scale,
+    );
+
+    if let Some(selection) = state.selection.as_ref().filter(|selection| selection.field == field) {
+        draw_text_caret(img, font, style, text, selection, text_x);
+    }
+}
+
 fn draw_portrait_panel_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout) -> Result<()> {
-    let portrait_crop = crop_norm(&assets.source, PORTRAIT_CROP)?;
     let target = layout.portrait.inner(4, 4);
-    overlay_fit(img, &portrait_crop, target);
+    overlay_fit_rgba(img, &assets.portrait_crt, target, FilterType::CatmullRom);
     stroke_rect(img, layout.portrait, BORDER, 3);
     Ok(())
 }
 
 fn draw_portrait_panel_dynamic(
     img: &mut RgbaImage,
+    assets: &Assets,
     layout: &Layout,
     state: &AppState,
     interactive: bool,
 ) {
+    if interactive && state.portrait_progress < 0.995 {
+        let target = layout.portrait.inner(4, 4);
+        draw_filled_rect_mut(img, Rect::at(target.x as i32, target.y as i32).of_size(target.w, target.h), PANEL_BG);
+        draw_pixelated_fade(img, &assets.portrait, target, state.portrait_progress);
+        let haze_alpha = ((state.portrait_progress - 0.58) / 0.42).clamp(0.0, 1.0) * 0.85;
+        if haze_alpha > 0.001 {
+            overlay_fit_rgba_alpha(
+                img,
+                &assets.portrait_crt,
+                target,
+                FilterType::CatmullRom,
+                haze_alpha,
+            );
+        }
+        stroke_rect(img, layout.portrait, BORDER, 3);
+    }
     if interactive && state.hover == Some(HitTarget::Tab(HeaderTab::Database)) {
         stroke_rect(img, layout.portrait.inner(8, 8), blend(BORDER, VALUE, 0.2), 1);
     }
@@ -958,10 +1372,10 @@ fn draw_fingerprint_panel_static(
         draw_centered_text(
             img,
             &assets.narrow_regular,
-            15.0,
+            14.0,
             VALUE,
             label_area,
-            labels_y + 1,
+            labels_y,
             &format!("{:02}", i + 1),
             0.55,
         );
@@ -1127,6 +1541,11 @@ fn hit_test(layout: &Layout, state: &AppState, x: u32, y: u32) -> Option<HitTarg
             return Some(HitTarget::Fingerprint(idx));
         }
     }
+    for field in EditableField::ORDER {
+        if field_style(layout, field).rect.contains(x, y) {
+            return Some(HitTarget::Field(field));
+        }
+    }
 
     None
 }
@@ -1170,6 +1589,7 @@ fn handle_click(state: &mut AppState, hit: HitTarget) -> bool {
             state.has_interacted = true;
             true
         }
+        HitTarget::Field(_) => false,
         HitTarget::MenuItem(action) => {
             apply_action(state, action);
             state.open_menu = None;
@@ -1192,6 +1612,168 @@ fn apply_action(state: &mut AppState, action: MenuAction) {
     }
 }
 
+fn drain_text_input(buffer: &Arc<Mutex<Vec<char>>>) -> Vec<char> {
+    if let Ok(mut chars) = buffer.lock() {
+        chars.drain(..).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn apply_text_input(state: &mut AppState, chars: Vec<char>) -> bool {
+    if chars.is_empty() {
+        return false;
+    }
+    let Some(selection) = state.selection.as_mut() else {
+        return false;
+    };
+    let insert: String = chars.into_iter().collect();
+    replace_selection_text(dossier_field_mut(&mut state.dossier, selection.field), selection, &insert);
+    state.has_interacted = true;
+    true
+}
+
+fn handle_text_edit_keys(window: &Window, state: &mut AppState) -> bool {
+    let Some(selection) = state.selection.as_mut() else {
+        return false;
+    };
+    let mut dirty = false;
+    let text = dossier_field_mut(&mut state.dossier, selection.field);
+
+    if window.is_key_pressed(Key::Backspace, KeyRepeat::Yes) {
+        dirty |= backspace_text(text, selection);
+    }
+    if window.is_key_pressed(Key::Delete, KeyRepeat::Yes) {
+        dirty |= delete_text(text, selection);
+    }
+    if window.is_key_pressed(Key::Left, KeyRepeat::Yes) {
+        move_selection_left(selection);
+        dirty = true;
+    }
+    if window.is_key_pressed(Key::Right, KeyRepeat::Yes) {
+        move_selection_right(selection, text);
+        dirty = true;
+    }
+    if window.is_key_pressed(Key::Home, KeyRepeat::Yes) {
+        selection.anchor = 0;
+        selection.caret = 0;
+        dirty = true;
+    }
+    if window.is_key_pressed(Key::End, KeyRepeat::Yes) {
+        let len = text.chars().count();
+        selection.anchor = len;
+        selection.caret = len;
+        dirty = true;
+    }
+    if window.is_key_pressed(Key::Enter, KeyRepeat::No) {
+        let next = selection.field.next();
+        let len = dossier_field(&state.dossier, next).chars().count();
+        *selection = TextSelection::collapsed(next, len);
+        dirty = true;
+    }
+
+    if dirty {
+        state.has_interacted = true;
+    }
+    dirty
+}
+
+fn replace_selection_text(text: &mut String, selection: &mut TextSelection, insert: &str) {
+    let (start, end) = selection.sorted();
+    let start_byte = byte_index_for_char(text, start);
+    let end_byte = byte_index_for_char(text, end);
+    text.replace_range(start_byte..end_byte, insert);
+    let next = start + insert.chars().count();
+    selection.anchor = next;
+    selection.caret = next;
+}
+
+fn backspace_text(text: &mut String, selection: &mut TextSelection) -> bool {
+    let (start, end) = selection.sorted();
+    if start != end {
+        replace_selection_text(text, selection, "");
+        return true;
+    }
+    if selection.caret == 0 {
+        return false;
+    }
+    let prev = selection.caret - 1;
+    let start_byte = byte_index_for_char(text, prev);
+    let end_byte = byte_index_for_char(text, selection.caret);
+    text.replace_range(start_byte..end_byte, "");
+    selection.anchor = prev;
+    selection.caret = prev;
+    true
+}
+
+fn delete_text(text: &mut String, selection: &mut TextSelection) -> bool {
+    let (start, end) = selection.sorted();
+    if start != end {
+        replace_selection_text(text, selection, "");
+        return true;
+    }
+    let len = text.chars().count();
+    if selection.caret >= len {
+        return false;
+    }
+    let start_byte = byte_index_for_char(text, selection.caret);
+    let end_byte = byte_index_for_char(text, selection.caret + 1);
+    text.replace_range(start_byte..end_byte, "");
+    true
+}
+
+fn move_selection_left(selection: &mut TextSelection) {
+    let (start, end) = selection.sorted();
+    let next = if start != end {
+        start
+    } else {
+        selection.caret.saturating_sub(1)
+    };
+    selection.anchor = next;
+    selection.caret = next;
+}
+
+fn move_selection_right(selection: &mut TextSelection, text: &str) {
+    let (start, end) = selection.sorted();
+    let len = text.chars().count();
+    let next = if start != end { end } else { (selection.caret + 1).min(len) };
+    selection.anchor = next;
+    selection.caret = next;
+}
+
+fn byte_index_for_char(text: &str, index: usize) -> usize {
+    text.char_indices().nth(index).map(|(byte, _)| byte).unwrap_or(text.len())
+}
+
+fn field_char_index(
+    assets: &Assets,
+    layout: &Layout,
+    state: &AppState,
+    field: EditableField,
+    x: u32,
+) -> usize {
+    let style = field_style(layout, field);
+    let font = resolve_field_font(assets, style.font);
+    let text = dossier_field(&state.dossier, field);
+    let text_width = estimate_text_width_scaled(font, text, style.size, 1.0, style.x_scale);
+    let text_x = match style.align {
+        TextAlign::Left => style.rect.x,
+        TextAlign::Right => style.rect.right().saturating_sub(text_width),
+    };
+    let positions = glyph_positions(font, text, style.size, style.x_scale);
+    let local = x.saturating_sub(text_x) as f32;
+
+    for idx in 0..positions.len().saturating_sub(1) {
+        let left = positions[idx];
+        let right = positions[idx + 1];
+        if local < (left + right) * 0.5 {
+            return idx;
+        }
+    }
+
+    text.chars().count()
+}
+
 fn overlay_fit(dst: &mut RgbaImage, src: &DynamicImage, target: PxRect) {
     let resized = image::imageops::resize(
         &src.to_rgba8(),
@@ -1200,6 +1782,36 @@ fn overlay_fit(dst: &mut RgbaImage, src: &DynamicImage, target: PxRect) {
         FilterType::CatmullRom,
     );
     image::imageops::overlay(dst, &resized, target.x.into(), target.y.into());
+}
+
+fn overlay_fit_rgba(dst: &mut RgbaImage, src: &RgbaImage, target: PxRect, filter: FilterType) {
+    let resized = image::imageops::resize(src, target.w.max(1), target.h.max(1), filter);
+    image::imageops::overlay(dst, &resized, target.x.into(), target.y.into());
+}
+
+fn overlay_fit_rgba_alpha(
+    dst: &mut RgbaImage,
+    src: &RgbaImage,
+    target: PxRect,
+    filter: FilterType,
+    alpha: f32,
+) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    if alpha <= 0.0 {
+        return;
+    }
+    let resized = image::imageops::resize(src, target.w.max(1), target.h.max(1), filter);
+    for py in 0..target.h {
+        for px in 0..target.w {
+            let sp = resized.get_pixel(px, py);
+            let dp = dst.get_pixel_mut(target.x + px, target.y + py);
+            for c in 0..3 {
+                let mixed = dp[c] as f32 * (1.0 - alpha) + sp[c] as f32 * alpha;
+                dp[c] = mixed.round().clamp(0.0, 255.0) as u8;
+            }
+            dp[3] = 255;
+        }
+    }
 }
 
 fn resize_to_window(img: &RgbaImage, w: u32, h: u32) -> RgbaImage {
@@ -1338,6 +1950,37 @@ fn draw_text(img: &mut RgbaImage, font: &FontArc, size: f32, color: Rgba<u8>, x:
     draw_text_mut(img, color, x as i32, y as i32, size, font, text);
 }
 
+fn resolve_field_font<'a>(assets: &'a Assets, font: FieldFont) -> &'a FontArc {
+    match font {
+        FieldFont::Mono => &assets.mono,
+        FieldFont::NarrowRegular => &assets.narrow_regular,
+    }
+}
+
+fn draw_text_scaled(
+    img: &mut RgbaImage,
+    font: &FontArc,
+    size: f32,
+    color: Rgba<u8>,
+    x: u32,
+    y: u32,
+    text: &str,
+    x_scale: f32,
+) {
+    if (x_scale - 1.0).abs() < 0.01 {
+        draw_text(img, font, size, color, x, y, text);
+        return;
+    }
+
+    let base_w = estimate_text_width(font, text, size, 1.0).saturating_add(8);
+    let base_h = ((size * 1.65).ceil() as u32).saturating_add(8);
+    let mut temp = RgbaImage::from_pixel(base_w.max(1), base_h.max(1), Rgba([0, 0, 0, 0]));
+    draw_text_mut(&mut temp, color, 0, 0, size, font, text);
+    let scaled_w = ((base_w as f32) * x_scale).round().max(1.0) as u32;
+    let scaled = image::imageops::resize(&temp, scaled_w, base_h, FilterType::CatmullRom);
+    image::imageops::overlay(img, &scaled, x.into(), y.into());
+}
+
 fn draw_centered_text(
     img: &mut RgbaImage,
     font: &FontArc,
@@ -1353,6 +1996,22 @@ fn draw_centered_text(
     draw_text(img, font, size, color, x, y, text);
 }
 
+fn draw_centered_text_scaled(
+    img: &mut RgbaImage,
+    font: &FontArc,
+    size: f32,
+    color: Rgba<u8>,
+    area: PxRect,
+    y: u32,
+    text: &str,
+    factor: f32,
+    x_scale: f32,
+) {
+    let w = estimate_text_width_scaled(font, text, size, factor, x_scale);
+    let x = area.x + area.w.saturating_sub(w) / 2;
+    draw_text_scaled(img, font, size, color, x, y, text, x_scale);
+}
+
 fn draw_right_text(
     img: &mut RgbaImage,
     font: &FontArc,
@@ -1365,6 +2024,21 @@ fn draw_right_text(
 ) {
     let w = estimate_text_width(font, text, size, factor);
     draw_text(img, font, size, color, right.saturating_sub(w), y, text);
+}
+
+fn draw_right_text_scaled(
+    img: &mut RgbaImage,
+    font: &FontArc,
+    size: f32,
+    color: Rgba<u8>,
+    right: u32,
+    y: u32,
+    text: &str,
+    factor: f32,
+    x_scale: f32,
+) {
+    let w = estimate_text_width_scaled(font, text, size, factor, x_scale);
+    draw_text_scaled(img, font, size, color, right.saturating_sub(w), y, text, x_scale);
 }
 
 fn estimate_text_width(font: &FontArc, text: &str, size: f32, _factor: f32) -> u32 {
@@ -1382,6 +2056,168 @@ fn estimate_text_width(font: &FontArc, text: &str, size: f32, _factor: f32) -> u
     }
 
     width.ceil().max(1.0) as u32
+}
+
+fn estimate_text_width_scaled(font: &FontArc, text: &str, size: f32, factor: f32, x_scale: f32) -> u32 {
+    ((estimate_text_width(font, text, size, factor) as f32) * x_scale)
+        .round()
+        .max(1.0) as u32
+}
+
+fn glyph_positions(font: &FontArc, text: &str, size: f32, x_scale: f32) -> Vec<f32> {
+    let scaled = font.as_scaled(size);
+    let mut width = 0.0f32;
+    let mut previous: Option<GlyphId> = None;
+    let mut positions = vec![0.0];
+
+    for ch in text.chars() {
+        let glyph = scaled.glyph_id(ch);
+        if let Some(prev) = previous {
+            width += scaled.kern(prev, glyph);
+        }
+        width += scaled.h_advance(glyph);
+        positions.push(width * x_scale);
+        previous = Some(glyph);
+    }
+
+    positions
+}
+
+fn draw_selection_highlight(
+    img: &mut RgbaImage,
+    font: &FontArc,
+    style: FieldStyle,
+    text: &str,
+    selection: &TextSelection,
+    text_x: u32,
+) {
+    let (start, end) = selection.sorted();
+    let positions = glyph_positions(font, text, style.size, style.x_scale);
+    let left = positions.get(start).copied().unwrap_or(0.0);
+    let right = positions.get(end).copied().unwrap_or(left);
+    if right <= left {
+        return;
+    }
+    let x = text_x + left.round() as u32;
+    let w = (right - left).round().max(1.0) as u32;
+    let y = style.rect.y + 2;
+    let h = style.rect.h.saturating_sub(4);
+    draw_filled_rect_mut(
+        img,
+        Rect::at(x as i32, y as i32).of_size(w, h),
+        blend(BADGE, PANEL_BG, 0.18),
+    );
+}
+
+fn draw_text_caret(
+    img: &mut RgbaImage,
+    font: &FontArc,
+    style: FieldStyle,
+    text: &str,
+    selection: &TextSelection,
+    text_x: u32,
+) {
+    let (start, end) = selection.sorted();
+    if start != end {
+        return;
+    }
+    let positions = glyph_positions(font, text, style.size, style.x_scale);
+    let x = text_x + positions.get(selection.caret).copied().unwrap_or(0.0).round() as u32;
+    let y = style.rect.y + 3;
+    let h = style.rect.h.saturating_sub(6).max(1);
+    draw_filled_rect_mut(img, Rect::at(x as i32, y as i32).of_size(2, h), BADGE);
+}
+
+fn draw_pixelated_fade(dst: &mut RgbaImage, src: &RgbaImage, target: PxRect, progress: f32) {
+    let eased = progress.clamp(0.0, 1.0);
+    let downsample = (((1.0 - eased).powf(1.8) * 34.0).round() as u32).max(1);
+    let small_w = (target.w / downsample).max(1);
+    let small_h = (target.h / downsample).max(1);
+    let tiny = image::imageops::resize(src, small_w, small_h, FilterType::Triangle);
+    let pixelated = image::imageops::resize(&tiny, target.w.max(1), target.h.max(1), FilterType::Nearest);
+    let alpha = (eased * eased).clamp(0.0, 1.0);
+
+    for py in 0..target.h {
+        for px in 0..target.w {
+            let src_px = pixelated.get_pixel(px, py);
+            let dst_px = dst.get_pixel_mut(target.x + px, target.y + py);
+            for channel in 0..3 {
+                let mixed = (dst_px[channel] as f32 * (1.0 - alpha)) + (src_px[channel] as f32 * alpha);
+                dst_px[channel] = mixed.round().clamp(0.0, 255.0) as u8;
+            }
+            dst_px[3] = 255;
+        }
+    }
+}
+
+fn build_crt_portrait(src: &RgbaImage) -> RgbaImage {
+    let (w, h) = src.dimensions();
+    let bloom_small = image::imageops::resize(
+        src,
+        (w / 5).max(1),
+        (h / 5).max(1),
+        FilterType::Triangle,
+    );
+    let bloom = image::imageops::resize(&bloom_small, w.max(1), h.max(1), FilterType::CatmullRom);
+    let smear_small = image::imageops::resize(
+        src,
+        (w / 3).max(1),
+        (h / 9).max(1),
+        FilterType::Triangle,
+    );
+    let smear = image::imageops::resize(&smear_small, w.max(1), h.max(1), FilterType::CatmullRom);
+    let mut out = src.clone();
+
+    for y in 0..h {
+        let scan = match y % 3 {
+            0 => 0.91,
+            1 => 1.02,
+            _ => 0.965,
+        };
+        let fy = y as f32 / h.max(1) as f32 - 0.5;
+
+        for x in 0..w {
+            let fx = x as f32 / w.max(1) as f32 - 0.5;
+            let vignette = (1.035 - fx.abs() * 0.12 - fy.abs() * 0.09).clamp(0.88, 1.04);
+            let sp = src.get_pixel(x, y);
+            let bp = bloom.get_pixel(x, y);
+            let hp = smear.get_pixel(x, y);
+            let luma =
+                (0.299 * sp[0] as f32 + 0.587 * sp[1] as f32 + 0.114 * sp[2] as f32) / 255.0;
+            let bloom_mix = 0.22 + luma * luma * 0.24;
+            let smear_mix = 0.08 + luma * 0.10;
+            let haze = 10.0 + luma * 18.0;
+            let glass = 4.0 + (0.5 - fy.abs()).max(0.0) * 6.0;
+            let px = out.get_pixel_mut(x, y);
+
+            let base_r = sp[0] as f32 * (1.0 - bloom_mix - smear_mix)
+                + bp[0] as f32 * bloom_mix
+                + hp[0] as f32 * smear_mix;
+            let base_g = sp[1] as f32 * (1.0 - bloom_mix - smear_mix)
+                + bp[1] as f32 * bloom_mix
+                + hp[1] as f32 * smear_mix;
+            let base_b = sp[2] as f32 * (1.0 - bloom_mix - smear_mix)
+                + bp[2] as f32 * bloom_mix
+                + hp[2] as f32 * smear_mix;
+
+            let r = (base_r + haze * 0.90 + glass * 0.55)
+                * scan
+                * vignette;
+            let g = (base_g + haze * 1.05 + glass * 0.78)
+                * scan
+                * vignette;
+            let b = (base_b + haze * 0.72 + glass * 0.42)
+                * scan
+                * vignette;
+
+            px[0] = r.round().clamp(0.0, 255.0) as u8;
+            px[1] = g.round().clamp(0.0, 255.0) as u8;
+            px[2] = b.round().clamp(0.0, 255.0) as u8;
+            px[3] = 255;
+        }
+    }
+
+    out
 }
 
 fn stroke_rect(img: &mut RgbaImage, rect: PxRect, color: Rgba<u8>, thickness: u32) {
