@@ -219,7 +219,7 @@ impl App {
     fn render_header(&self, frame: &mut ratatui::Frame, area: Rect) {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(43), Constraint::Min(0)])
+            .constraints([Constraint::Length(44), Constraint::Min(0)])
             .split(area);
 
         let left_block = bar_block();
@@ -230,12 +230,12 @@ impl App {
         });
         let left_layout = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(4), Constraint::Min(0)])
+            .constraints([Constraint::Length(5), Constraint::Min(0)])
             .split(left_inner);
 
         frame.render_widget(
             Paragraph::new(Line::styled(
-                "W",
+                "VV",
                 Style::default()
                     .fg(VALUE)
                     .bg(PANEL_BG)
@@ -276,12 +276,12 @@ impl App {
     fn render_status_bar(&self, frame: &mut ratatui::Frame, area: Rect) {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(41)])
+            .constraints([Constraint::Min(0), Constraint::Length(40)])
             .split(area);
 
         let left = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(7)])
+            .constraints([Constraint::Min(0), Constraint::Length(6)])
             .split(columns[0]);
 
         let meta = Text::from(vec![
@@ -302,7 +302,7 @@ impl App {
         frame.render_widget(badge_block.clone(), left[1]);
         let badge_inner = badge_block.inner(left[1]).inner(Margin {
             horizontal: 1,
-            vertical: 1,
+            vertical: 0,
         });
         frame.render_widget(
             Paragraph::new(Line::styled(
