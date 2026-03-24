@@ -1,0 +1,14 @@
+[package]
+name = "romulus"
+version = "0.1.0"
+edition = "2024"
+default-run = "romulus"
+
+[dependencies]
+ab_glyph = "0.2"
+anyhow = "1"
+color-eyre = "0.6"
+crossterm = "0.29"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+imageproc = { version = "0.25", default-features = false }
+ratatui = "0.30"

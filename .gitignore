@@ -1,0 +1,12 @@
+/target
+
+# Windows metadata
+*.Zone.Identifier
+
+# Generated comparison / probe artifacts
+comparison.png
+tui-shot.png
+zoom-compare.png
+probe-sheet.png
+probe_out/
+fp*.png
