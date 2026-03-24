@@ -12,3 +12,5 @@ probe_out/
 fp*.png
 
 trace_grid_out/
+custom_trace_out/
+custom-renderer-shot.png
