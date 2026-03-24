@@ -12,3 +12,4 @@ crossterm = "0.29"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 imageproc = { version = "0.25", default-features = false }
 ratatui = "0.30"
+ratatui-image = { version = "10.0.6", default-features = false, features = ["image-defaults", "crossterm"] }
