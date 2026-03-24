@@ -29,11 +29,6 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use ratatui_image::{
-    Resize, StatefulImage,
-    picker::{Picker, ProtocolType},
-    protocol::StatefulProtocol,
-};
 
 const BG: Color = Color::Rgb(5, 10, 9);
 const PANEL_BG: Color = Color::Rgb(8, 15, 12);
@@ -74,16 +69,18 @@ fn main() -> Result<()> {
     color_eyre::install()?;
 
     let cli = Cli::parse()?;
+    let app = App {
+        art: ReferenceArt::load(&cli.image_path).ok(),
+        image_path: cli.image_path,
+    };
 
     if let Some(path) = cli.screenshot_path {
-        let app = App::new_text(cli.image_path);
         app.capture_png(&path, SCREENSHOT_COLS, SCREENSHOT_ROWS)?;
         println!("saved screenshot to {}", path.display());
         return Ok(());
     }
 
     let mut terminal = setup_terminal()?;
-    let app = App::new_live(cli.image_path);
     let result = app.run(&mut terminal);
     restore_terminal(&mut terminal)?;
     result
@@ -142,54 +139,12 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 struct App {
     art: Option<ReferenceArt>,
     image_path: PathBuf,
-    media: MediaMode,
-}
-
-#[allow(dead_code)]
-enum MediaMode {
-    Text,
-    Pixel(PixelScene),
-    Graphics(GraphicsMedia),
-}
-
-struct PixelScene {
-    _protocol: ProtocolType,
-    scene: StatefulProtocol,
-}
-
-struct GraphicsMedia {
-    _protocol: ProtocolType,
-    portrait: StatefulProtocol,
-    fingerprints: Vec<StatefulProtocol>,
 }
 
 impl App {
-    fn new_text(image_path: PathBuf) -> Self {
-        Self {
-            art: ReferenceArt::load(&image_path).ok(),
-            image_path,
-            media: MediaMode::Text,
-        }
-    }
-
-    fn new_live(image_path: PathBuf) -> Self {
-        let art = ReferenceArt::load(&image_path).ok();
-        let media = art
-            .as_ref()
-            .and_then(build_pixel_media)
-            .unwrap_or(MediaMode::Text);
-
-        Self {
-            art,
-            image_path,
-            media,
-        }
-    }
-
-    fn run(mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    fn run(self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         loop {
             terminal.draw(|frame| self.render(frame))?;
-            self.reconcile_media();
 
             if !event::poll(Duration::from_millis(200))? {
                 continue;
@@ -213,57 +168,13 @@ impl App {
     }
 
     fn capture_png(&self, output_path: &Path, cols: u16, rows: u16) -> Result<()> {
-        if let Some(art) = &self.art {
-            return render_dynamic_image_png(&art.image, output_path, cols, rows);
-        }
-
         let backend = TestBackend::new(cols, rows);
         let mut terminal = Terminal::new(backend)?;
-        let mut preview = App::new_text(self.image_path.clone());
-        terminal.draw(|frame| preview.render(frame))?;
+        terminal.draw(|frame| self.render(frame))?;
         render_buffer_png(terminal.backend().buffer(), output_path)
     }
 
-    fn render(&mut self, frame: &mut ratatui::Frame) {
-        match self.media {
-            MediaMode::Text => self.render_text(frame),
-            MediaMode::Pixel(_) => self.render_pixel_scene(frame),
-            MediaMode::Graphics(_) => self.render_live(frame),
-        }
-    }
-
-    fn render_text(&mut self, frame: &mut ratatui::Frame) {
-        self.render_chrome(frame, false);
-    }
-
-    fn render_live(&mut self, frame: &mut ratatui::Frame) {
-        self.render_chrome(frame, true);
-    }
-
-    fn render_pixel_scene(&mut self, frame: &mut ratatui::Frame) {
-        let area = frame.area();
-        frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
-
-        if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
-            self.render_text(frame);
-            return;
-        }
-
-        let canvas = fit_rect_to_ratio(
-            centered(area, area.width.saturating_sub(2), area.height.saturating_sub(2)),
-            1197.0 / 907.0,
-        );
-
-        if let MediaMode::Pixel(pixel) = &mut self.media {
-            frame.render_stateful_widget(
-                StatefulImage::default().resize(Resize::Scale(Some(FilterType::CatmullRom))),
-                canvas,
-                &mut pixel.scene,
-            );
-        }
-    }
-
-    fn render_chrome(&mut self, frame: &mut ratatui::Frame, use_graphics: bool) {
+    fn render(&self, frame: &mut ratatui::Frame) {
         let area = frame.area();
         frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
 
@@ -302,36 +213,7 @@ impl App {
 
         self.render_header(frame, rows[0]);
         self.render_status_bar(frame, rows[1]);
-        self.render_body(frame, rows[2], use_graphics);
-    }
-
-    fn reconcile_media(&mut self) {
-        match &mut self.media {
-            MediaMode::Text => {}
-            MediaMode::Pixel(pixel) => {
-                if pixel
-                    .scene
-                    .last_encoding_result()
-                    .is_some_and(|result| result.is_err())
-                {
-                    self.media = MediaMode::Text;
-                }
-            }
-            MediaMode::Graphics(media) => {
-                let portrait_failed = media
-                    .portrait
-                    .last_encoding_result()
-                    .is_some_and(|result| result.is_err());
-                let fingerprints_failed = media
-                    .fingerprints
-                    .iter_mut()
-                    .any(|print| print.last_encoding_result().is_some_and(|result| result.is_err()));
-
-                if portrait_failed || fingerprints_failed {
-                    self.media = MediaMode::Text;
-                }
-            }
-        }
+        self.render_body(frame, rows[2]);
     }
 
     fn render_header(&self, frame: &mut ratatui::Frame, area: Rect) {
@@ -450,14 +332,14 @@ impl App {
         frame.render_widget(Paragraph::new(right).block(panel_block()), columns[1]);
     }
 
-    fn render_body(&mut self, frame: &mut ratatui::Frame, area: Rect, use_graphics: bool) {
+    fn render_body(&self, frame: &mut ratatui::Frame, area: Rect) {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(51), Constraint::Percentage(49)])
             .split(area);
 
         self.render_info_panel(frame, columns[0]);
-        self.render_media_panel(frame, columns[1], use_graphics);
+        self.render_media_panel(frame, columns[1]);
     }
 
     fn render_info_panel(&self, frame: &mut ratatui::Frame, area: Rect) {
@@ -575,31 +457,20 @@ impl App {
         }
     }
 
-    fn render_media_panel(&mut self, frame: &mut ratatui::Frame, area: Rect, use_graphics: bool) {
+    fn render_media_panel(&self, frame: &mut ratatui::Frame, area: Rect) {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(0), Constraint::Length(6)])
             .split(area);
 
-        self.render_portrait(frame, rows[0], use_graphics);
-        self.render_fingerprints(frame, rows[1], use_graphics);
+        self.render_portrait(frame, rows[0]);
+        self.render_fingerprints(frame, rows[1]);
     }
 
-    fn render_portrait(&mut self, frame: &mut ratatui::Frame, area: Rect, use_graphics: bool) {
+    fn render_portrait(&self, frame: &mut ratatui::Frame, area: Rect) {
         let block = panel_block();
         frame.render_widget(block.clone(), area);
         let inner = block.inner(area);
-
-        if use_graphics {
-            if let MediaMode::Graphics(media) = &mut self.media {
-                frame.render_stateful_widget(
-                    StatefulImage::default().resize(Resize::Scale(Some(FilterType::CatmullRom))),
-                    inner,
-                    &mut media.portrait,
-                );
-                return;
-            }
-        }
 
         let art = self
             .art
@@ -625,7 +496,7 @@ impl App {
         );
     }
 
-    fn render_fingerprints(&mut self, frame: &mut ratatui::Frame, area: Rect, use_graphics: bool) {
+    fn render_fingerprints(&self, frame: &mut ratatui::Frame, area: Rect) {
         let block = panel_block();
         frame.render_widget(block.clone(), area);
         let inner = block.inner(area);
@@ -683,20 +554,6 @@ impl App {
             } else {
                 area
             };
-
-            if use_graphics {
-                if let MediaMode::Graphics(media) = &mut self.media {
-                    if let Some(state) = media.fingerprints.get_mut(index) {
-                        frame.render_stateful_widget(
-                            StatefulImage::default()
-                                .resize(Resize::Scale(Some(FilterType::CatmullRom))),
-                            inner,
-                            state,
-                        );
-                        continue;
-                    }
-                }
-            }
 
             let art = self
                 .art
@@ -886,37 +743,6 @@ impl ReferenceArt {
     }
 }
 
-#[allow(dead_code)]
-fn build_graphics_media(art: &ReferenceArt) -> Option<MediaMode> {
-    let picker = Picker::from_query_stdio().ok()?;
-    if picker.protocol_type() == ProtocolType::Halfblocks {
-        return None;
-    }
-
-    let portrait = picker.new_resize_protocol(art.crop(PORTRAIT_CROP)?);
-    let fingerprints = (0..5)
-        .map(|index| art.crop(fingerprint_crop(index)).map(|img| picker.new_resize_protocol(img)))
-        .collect::<Option<Vec<_>>>()?;
-
-    Some(MediaMode::Graphics(GraphicsMedia {
-        _protocol: picker.protocol_type(),
-        portrait,
-        fingerprints,
-    }))
-}
-
-fn build_pixel_media(art: &ReferenceArt) -> Option<MediaMode> {
-    let picker = Picker::from_query_stdio().ok()?;
-    if picker.protocol_type() == ProtocolType::Halfblocks {
-        return None;
-    }
-
-    Some(MediaMode::Pixel(PixelScene {
-        _protocol: picker.protocol_type(),
-        scene: picker.new_resize_protocol(art.image.clone()),
-    }))
-}
-
 fn render_buffer_png(buffer: &Buffer, output_path: &Path) -> Result<()> {
     let font_bytes = fs::read(DEFAULT_FONT)
         .ok()
@@ -971,28 +797,6 @@ fn render_buffer_png(buffer: &Buffer, output_path: &Path) -> Result<()> {
     }
 
     image.save(output_path)?;
-    Ok(())
-}
-
-fn render_dynamic_image_png(
-    source: &DynamicImage,
-    output_path: &Path,
-    cols: u16,
-    rows: u16,
-) -> Result<()> {
-    let width_px = cols as u32 * CELL_WIDTH_PX;
-    let height_px = rows as u32 * CELL_HEIGHT_PX;
-    let mut canvas = RgbaImage::from_pixel(width_px, height_px, rgba(BG));
-
-    let fitted = image::imageops::thumbnail(
-        &source.to_rgba8(),
-        width_px.saturating_sub(8),
-        height_px.saturating_sub(8),
-    );
-    let x = (width_px.saturating_sub(fitted.width())) / 2;
-    let y = (height_px.saturating_sub(fitted.height())) / 2;
-    image::imageops::overlay(&mut canvas, &fitted, x.into(), y.into());
-    canvas.save(output_path)?;
     Ok(())
 }
 
@@ -1373,21 +1177,6 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     )
-}
-
-fn fit_rect_to_ratio(area: Rect, ratio: f32) -> Rect {
-    if area.width == 0 || area.height == 0 {
-        return area;
-    }
-
-    let area_ratio = area.width as f32 / area.height as f32;
-    if area_ratio > ratio {
-        let width = (area.height as f32 * ratio).round() as u16;
-        centered(area, width, area.height)
-    } else {
-        let height = (area.width as f32 / ratio).round() as u16;
-        centered(area, area.width, height)
-    }
 }
 
 fn label_style() -> Style {
