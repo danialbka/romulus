@@ -146,15 +146,17 @@ fn main() -> Result<()> {
     let assets = Assets::load(cli.image_path.as_deref())?;
     let layout = Layout::new();
     let state = AppState::default();
+    let static_frame = render_static_scene(&assets, &layout)?;
 
     if let Some(path) = cli.screenshot_path {
-        let frame = render_scene(&assets, &layout, &state, false)?;
+        let mut frame = static_frame.clone();
+        render_scene(&mut frame, &static_frame, &assets, &layout, &state, false);
         frame.save(&path)?;
         println!("saved screenshot to {}", path.display());
         return Ok(());
     }
 
-    show_window(&assets, &layout, cli.scale)
+    show_window(&assets, &layout, &static_frame, cli.scale)
 }
 
 struct Cli {
@@ -463,7 +465,7 @@ fn load_font_bytes(bytes: &[u8], label: &str) -> Result<FontArc> {
     FontArc::try_from_vec(bytes.to_vec()).map_err(|_| anyhow::anyhow!("invalid font data in {label}"))
 }
 
-fn show_window(assets: &Assets, layout: &Layout, scale: f32) -> Result<()> {
+fn show_window(assets: &Assets, layout: &Layout, static_frame: &RgbaImage, scale: f32) -> Result<()> {
     let start_w = (BASE_W as f32 * scale).round().max(1.0) as usize;
     let start_h = (BASE_H as f32 * scale).round().max(1.0) as usize;
     let mut window = Window::new(
@@ -479,12 +481,12 @@ fn show_window(assets: &Assets, layout: &Layout, scale: f32) -> Result<()> {
     window.set_target_fps(60);
 
     let mut state = AppState::default();
-    let mut frame = render_scene(assets, layout, &state, true)?;
-    let mut scaled = resize_to_window(&frame, start_w as u32, start_h as u32);
-    let mut buffer = rgba_to_u32(&scaled);
+    let mut frame = static_frame.clone();
+    render_scene(&mut frame, static_frame, assets, layout, &state, true);
     let mut last_size = (start_w, start_h);
     let mut mouse_was_down = false;
     let clock_started = Instant::now();
+    let mut needs_present = true;
 
     while window.is_open() && !window.is_key_down(Key::Q) {
         let mut dirty = false;
@@ -544,45 +546,33 @@ fn show_window(assets: &Assets, layout: &Layout, scale: f32) -> Result<()> {
         mouse_was_down = mouse_down;
 
         if dirty {
-            frame = render_scene(assets, layout, &state, true)?;
+            render_scene(&mut frame, static_frame, assets, layout, &state, true);
         }
 
-        if dirty || last_size != (window_w, window_h) {
-            scaled = resize_to_window(&frame, window_w as u32, window_h as u32);
-            buffer = rgba_to_u32(&scaled);
+        if needs_present || dirty || last_size != (window_w, window_h) {
+            let buffer = if window_w as u32 == BASE_W && window_h as u32 == BASE_H {
+                rgba_to_u32(&frame)
+            } else {
+                let scaled = resize_to_window(&frame, window_w as u32, window_h as u32);
+                rgba_to_u32(&scaled)
+            };
             last_size = (window_w, window_h);
+            needs_present = false;
+            window.update_with_buffer(&buffer, window_w, window_h)?;
+        } else {
+            window.update();
         }
-
-        window.update_with_buffer(&buffer, window_w, window_h)?;
     }
 
     Ok(())
 }
 
-fn render_scene(assets: &Assets, layout: &Layout, state: &AppState, interactive: bool) -> Result<RgbaImage> {
+fn render_static_scene(assets: &Assets, layout: &Layout) -> Result<RgbaImage> {
     let mut img = RgbaImage::from_pixel(BASE_W, BASE_H, BG);
 
-    let corp_hot = interactive
-        && (state.hover == Some(HitTarget::Tab(HeaderTab::Corp)) || state.open_menu == Some(MenuKind::Corp));
-    let db_hot = interactive
-        && (state.hover == Some(HitTarget::Tab(HeaderTab::Database))
-            || state.open_menu == Some(MenuKind::Database));
-
     stroke_rect(&mut img, layout.outer, BORDER, 3);
-    fill_stroke_rect(
-        &mut img,
-        layout.header_left,
-        if corp_hot { blend(HEADER_BG, BADGE, 0.12) } else { HEADER_BG },
-        BORDER,
-        3,
-    );
-    fill_stroke_rect(
-        &mut img,
-        layout.header_center,
-        if db_hot { blend(HEADER_BG, BADGE, 0.12) } else { HEADER_BG },
-        BORDER,
-        3,
-    );
+    fill_stroke_rect(&mut img, layout.header_left, HEADER_BG, BORDER, 3);
+    fill_stroke_rect(&mut img, layout.header_center, HEADER_BG, BORDER, 3);
     fill_stroke_rect(&mut img, layout.status_left, PANEL_BG, BORDER, 3);
     fill_stroke_rect(&mut img, layout.badge, PANEL_BG, BORDER, 3);
     fill_stroke_rect(&mut img, layout.status_right, PANEL_BG, BORDER, 3);
@@ -590,38 +580,50 @@ fn render_scene(assets: &Assets, layout: &Layout, state: &AppState, interactive:
     fill_stroke_rect(&mut img, layout.portrait, PANEL_BG, BORDER, 3);
     fill_stroke_rect(&mut img, layout.finger, PANEL_BG, BORDER, 3);
 
-    draw_header(&mut img, assets, layout, state, interactive)?;
-    draw_status(&mut img, assets, layout, state, interactive);
-    draw_left_panel(&mut img, assets, layout, state, interactive);
-    draw_portrait_panel(&mut img, assets, layout, state, interactive)?;
-    draw_fingerprint_panel(&mut img, assets, layout, state, interactive)?;
-
-    if interactive && state.has_interacted {
-        match state.view {
-            ViewMode::Profile => stroke_rect(&mut img, layout.left_panel.inner(6, 6), blend(BORDER, BADGE, 0.3), 2),
-            ViewMode::Biometrics => {
-                stroke_rect(&mut img, layout.portrait.inner(4, 4), blend(BORDER, BADGE, 0.34), 2);
-                stroke_rect(&mut img, layout.finger.inner(4, 4), blend(BORDER, BADGE, 0.34), 2);
-            }
-            ViewMode::Relations => stroke_rect(&mut img, layout.relations_focus, blend(BORDER, BADGE, 0.34), 2),
-        }
-    }
-
-    if interactive {
-        if let Some(kind) = state.open_menu {
-            draw_menu_overlay(&mut img, assets, layout, state, kind);
-        }
-    }
+    draw_header_static(&mut img, assets, layout)?;
+    draw_status_static(&mut img, assets, layout);
+    draw_left_panel_static(&mut img, assets, layout);
+    draw_portrait_panel_static(&mut img, assets, layout)?;
+    draw_fingerprint_panel_static(&mut img, assets, layout)?;
 
     Ok(img)
 }
 
-fn draw_header(
-    img: &mut RgbaImage,
+fn render_scene(
+    frame: &mut RgbaImage,
+    static_frame: &RgbaImage,
     assets: &Assets,
     layout: &Layout,
     state: &AppState,
     interactive: bool,
+) {
+    frame.clone_from(static_frame);
+    draw_header_dynamic(frame, layout, state, interactive);
+    draw_status_dynamic(frame, assets, layout, state, interactive);
+    draw_left_panel_dynamic(frame, assets, layout, state, interactive);
+    draw_portrait_panel_dynamic(frame, layout, state, interactive);
+    draw_fingerprint_panel_dynamic(frame, assets, layout, state, interactive);
+
+    if interactive && state.has_interacted {
+        match state.view {
+            ViewMode::Profile => stroke_rect(frame, layout.left_panel.inner(6, 6), blend(BORDER, BADGE, 0.3), 2),
+            ViewMode::Biometrics => {
+                stroke_rect(frame, layout.portrait.inner(4, 4), blend(BORDER, BADGE, 0.34), 2);
+                stroke_rect(frame, layout.finger.inner(4, 4), blend(BORDER, BADGE, 0.34), 2);
+            }
+            ViewMode::Relations => stroke_rect(frame, layout.relations_focus, blend(BORDER, BADGE, 0.34), 2),
+        }
+    }
+
+    if interactive && let Some(kind) = state.open_menu {
+        draw_menu_overlay(frame, assets, layout, state, kind);
+    }
+}
+
+fn draw_header_static(
+    img: &mut RgbaImage,
+    assets: &Assets,
+    layout: &Layout,
 ) -> Result<()> {
     let logo_area = PxRect::new(layout.header_left.x + 12, layout.header_left.y + 7, 50, 18);
     let logo = crop_norm(&assets.source, LOGO_CROP)?;
@@ -646,27 +648,24 @@ fn draw_header(
         0.58,
     );
 
-    if interactive {
-        if state.hover == Some(HitTarget::Tab(HeaderTab::Corp)) || state.open_menu == Some(MenuKind::Corp) {
-            let line = PxRect::new(layout.header_left.x + 8, layout.header_left.bottom() - 5, layout.header_left.w - 16, 2);
-            draw_filled_rect_mut(img, Rect::at(line.x as i32, line.y as i32).of_size(line.w, line.h), BADGE);
-        }
-        if state.hover == Some(HitTarget::Tab(HeaderTab::Database)) || state.open_menu == Some(MenuKind::Database) {
-            let line = PxRect::new(layout.header_center.x + 8, layout.header_center.bottom() - 5, layout.header_center.w - 16, 2);
-            draw_filled_rect_mut(img, Rect::at(line.x as i32, line.y as i32).of_size(line.w, line.h), BADGE);
-        }
-    }
-
     Ok(())
 }
 
-fn draw_status(
-    img: &mut RgbaImage,
-    assets: &Assets,
-    layout: &Layout,
-    state: &AppState,
-    interactive: bool,
-) {
+fn draw_header_dynamic(img: &mut RgbaImage, layout: &Layout, state: &AppState, interactive: bool) {
+    if !interactive {
+        return;
+    }
+    if state.hover == Some(HitTarget::Tab(HeaderTab::Corp)) || state.open_menu == Some(MenuKind::Corp) {
+        let line = PxRect::new(layout.header_left.x + 8, layout.header_left.bottom() - 5, layout.header_left.w - 16, 2);
+        draw_filled_rect_mut(img, Rect::at(line.x as i32, line.y as i32).of_size(line.w, line.h), BADGE);
+    }
+    if state.hover == Some(HitTarget::Tab(HeaderTab::Database)) || state.open_menu == Some(MenuKind::Database) {
+        let line = PxRect::new(layout.header_center.x + 8, layout.header_center.bottom() - 5, layout.header_center.w - 16, 2);
+        draw_filled_rect_mut(img, Rect::at(line.x as i32, line.y as i32).of_size(line.w, line.h), BADGE);
+    }
+}
+
+fn draw_status_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout) {
     draw_text(img, &assets.narrow, 18.0, LABEL, layout.status_left.x + 18, layout.status_left.y + 14, "USER:");
     draw_text(
         img,
@@ -695,7 +694,16 @@ fn draw_status(
         layout.status_left.y + 35,
         "JACKSON'S STAR COLONY",
     );
+    draw_text(img, &assets.narrow, 18.0, LABEL, layout.status_right.x + 22, layout.status_right.y + 38, "LOG_ID");
+}
 
+fn draw_status_dynamic(
+    img: &mut RgbaImage,
+    assets: &Assets,
+    layout: &Layout,
+    state: &AppState,
+    interactive: bool,
+) {
     let inner = PxRect::new(layout.badge.x + 11, layout.badge.y + 9, layout.badge.w - 22, layout.badge.h - 18);
     let badge_fill = if interactive && (state.hover == Some(HitTarget::Badge) || state.open_menu == Some(MenuKind::Badge)) {
         blend(BADGE, VALUE, 0.12)
@@ -720,7 +728,6 @@ fn draw_status(
             "SYSTEM ONLINE"
         },
     );
-    draw_text(img, &assets.narrow, 18.0, LABEL, layout.status_right.x + 22, layout.status_right.y + 38, "LOG_ID");
     if interactive && state.has_interacted {
         let detail = match state.view {
             ViewMode::Profile => "PROFILE",
@@ -731,15 +738,8 @@ fn draw_status(
     }
 }
 
-fn draw_left_panel(
-    img: &mut RgbaImage,
-    assets: &Assets,
-    layout: &Layout,
-    state: &AppState,
-    interactive: bool,
-) {
+fn draw_left_panel_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout) {
     let area = layout.left_panel;
-
     draw_text(img, &assets.narrow, 18.0, LABEL, area.x + 20, area.y + 34, "CITIZEN ID:");
     draw_right_text(
         img,
@@ -751,63 +751,6 @@ fn draw_left_panel(
         "FWC25583",
         0.58,
     );
-
-    fill_stroke_rect(
-        img,
-        layout.dept,
-        if interactive && (state.hover == Some(HitTarget::Department) || state.open_menu == Some(MenuKind::Department)) {
-            blend(PANEL_BG, HEADER_BG, 0.25)
-        } else {
-            PANEL_BG
-        },
-        BORDER,
-        3,
-    );
-    let dept_label = PxRect::new(layout.dept.x, layout.dept.y, 74, layout.dept.h);
-    draw_filled_rect_mut(
-        img,
-        Rect::at(dept_label.x as i32, dept_label.y as i32).of_size(dept_label.w, dept_label.h),
-        LABEL,
-    );
-    draw_text(img, &assets.narrow, 18.0, PANEL_BG, dept_label.x + 12, dept_label.y + 8, "DEPT.");
-    draw_text(
-        img,
-        &assets.narrow,
-        20.0,
-        VALUE,
-        layout.dept.x + 92,
-        layout.dept.y + 7,
-        state.department.label(),
-    );
-
-    for (gender, box_rect) in layout.gender_boxes {
-        let is_selected = state.gender == gender;
-        let is_hovered = interactive && state.hover == Some(HitTarget::Gender(gender));
-        fill_stroke_rect(
-            img,
-            box_rect,
-            if is_selected {
-                BADGE
-            } else if is_hovered {
-                blend(PANEL_BG, HEADER_BG, 0.25)
-            } else {
-                PANEL_BG
-            },
-            if is_hovered { blend(BORDER, VALUE, 0.35) } else { BORDER },
-            3,
-        );
-        draw_centered_text(
-            img,
-            &assets.narrow,
-            22.0,
-            if is_selected { PANEL_BG } else { VALUE },
-            box_rect,
-            box_rect.y + 7,
-            gender.label(),
-            0.55,
-        );
-    }
-
     draw_text(img, &assets.mono, 28.0, MUTED, area.x + 8, area.y + 168, ">");
     draw_text(img, &assets.mono, 28.0, MUTED, area.x + 8, area.y + 196, ">");
 
@@ -890,31 +833,93 @@ fn draw_left_panel(
     );
 }
 
-fn draw_portrait_panel(
+fn draw_left_panel_dynamic(
     img: &mut RgbaImage,
     assets: &Assets,
     layout: &Layout,
     state: &AppState,
     interactive: bool,
-) -> Result<()> {
+) {
+    fill_stroke_rect(
+        img,
+        layout.dept,
+        if interactive && (state.hover == Some(HitTarget::Department) || state.open_menu == Some(MenuKind::Department)) {
+            blend(PANEL_BG, HEADER_BG, 0.25)
+        } else {
+            PANEL_BG
+        },
+        BORDER,
+        3,
+    );
+    let dept_label = PxRect::new(layout.dept.x, layout.dept.y, 74, layout.dept.h);
+    draw_filled_rect_mut(
+        img,
+        Rect::at(dept_label.x as i32, dept_label.y as i32).of_size(dept_label.w, dept_label.h),
+        LABEL,
+    );
+    draw_text(img, &assets.narrow, 18.0, PANEL_BG, dept_label.x + 12, dept_label.y + 8, "DEPT.");
+    draw_text(
+        img,
+        &assets.narrow,
+        20.0,
+        VALUE,
+        layout.dept.x + 92,
+        layout.dept.y + 7,
+        state.department.label(),
+    );
+
+    for (gender, box_rect) in layout.gender_boxes {
+        let is_selected = state.gender == gender;
+        let is_hovered = interactive && state.hover == Some(HitTarget::Gender(gender));
+        fill_stroke_rect(
+            img,
+            box_rect,
+            if is_selected {
+                BADGE
+            } else if is_hovered {
+                blend(PANEL_BG, HEADER_BG, 0.25)
+            } else {
+                PANEL_BG
+            },
+            if is_hovered { blend(BORDER, VALUE, 0.35) } else { BORDER },
+            3,
+        );
+        draw_centered_text(
+            img,
+            &assets.narrow,
+            22.0,
+            if is_selected { PANEL_BG } else { VALUE },
+            box_rect,
+            box_rect.y + 7,
+            gender.label(),
+            0.55,
+        );
+    }
+}
+
+fn draw_portrait_panel_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout) -> Result<()> {
     let portrait_crop = crop_norm(&assets.source, PORTRAIT_CROP)?;
     let target = layout.portrait.inner(4, 4);
     overlay_fit(img, &portrait_crop, target);
     stroke_rect(img, layout.portrait, BORDER, 3);
-
-    if interactive && state.hover == Some(HitTarget::Tab(HeaderTab::Database)) {
-        stroke_rect(img, layout.portrait.inner(8, 8), blend(BORDER, VALUE, 0.2), 1);
-    }
-
     Ok(())
 }
 
-fn draw_fingerprint_panel(
+fn draw_portrait_panel_dynamic(
     img: &mut RgbaImage,
-    assets: &Assets,
     layout: &Layout,
     state: &AppState,
     interactive: bool,
+) {
+    if interactive && state.hover == Some(HitTarget::Tab(HeaderTab::Database)) {
+        stroke_rect(img, layout.portrait.inner(8, 8), blend(BORDER, VALUE, 0.2), 1);
+    }
+}
+
+fn draw_fingerprint_panel_static(
+    img: &mut RgbaImage,
+    assets: &Assets,
+    layout: &Layout,
 ) -> Result<()> {
     let labels_y = layout.finger.y + 8;
     let step = layout.finger.w / 5;
@@ -926,49 +931,69 @@ fn draw_fingerprint_panel(
         }
 
         let label_area = PxRect::new(x, labels_y, step, 18);
-        let is_selected = state.selected_print == i as usize;
-        let is_hovered = interactive && state.hover == Some(HitTarget::Fingerprint(i as usize));
-        if interactive && (is_selected || is_hovered) {
-            let chip = PxRect::new(x + step / 2 - 18, labels_y - 2, 36, 18);
-            draw_filled_rect_mut(
-                img,
-                Rect::at(chip.x as i32, chip.y as i32).of_size(chip.w, chip.h),
-                if is_selected { BADGE } else { blend(PANEL_BG, HEADER_BG, 0.32) },
-            );
-            draw_centered_text(
-                img,
-                &assets.narrow,
-                16.0,
-                if is_selected { PANEL_BG } else { VALUE },
-                chip,
-                chip.y + 1,
-                &format!("{:02}", i + 1),
-                0.55,
-            );
-        } else {
-            draw_centered_text(
-                img,
-                &assets.narrow,
-                16.0,
-                VALUE,
-                label_area,
-                labels_y,
-                &format!("{:02}", i + 1),
-                0.55,
-            );
-        }
+        draw_centered_text(
+            img,
+            &assets.narrow,
+            16.0,
+            VALUE,
+            label_area,
+            labels_y,
+            &format!("{:02}", i + 1),
+            0.55,
+        );
 
         let crop = fingerprint_crop(i as usize);
         let sprite = crop_norm(&assets.source, crop)?;
         let cell = layout.finger_cells[i as usize];
         overlay_fit(img, &sprite, cell);
-        if interactive && (is_selected || is_hovered) {
-            stroke_rect(img, cell.inner(1, 1), if is_selected { BADGE } else { blend(BORDER, VALUE, 0.25) }, 2);
-        }
     }
 
     stroke_rect(img, layout.finger, BORDER, 3);
     Ok(())
+}
+
+fn draw_fingerprint_panel_dynamic(
+    img: &mut RgbaImage,
+    assets: &Assets,
+    layout: &Layout,
+    state: &AppState,
+    interactive: bool,
+) {
+    if !interactive {
+        return;
+    }
+
+    let labels_y = layout.finger.y + 8;
+    let step = layout.finger.w / 5;
+
+    for i in 0..5u32 {
+        let is_selected = state.selected_print == i as usize;
+        let is_hovered = state.hover == Some(HitTarget::Fingerprint(i as usize));
+        if !is_selected && !is_hovered {
+            continue;
+        }
+
+        let x = layout.finger.x + i * step;
+        let chip = PxRect::new(x + step / 2 - 18, labels_y - 2, 36, 18);
+        draw_filled_rect_mut(
+            img,
+            Rect::at(chip.x as i32, chip.y as i32).of_size(chip.w, chip.h),
+            if is_selected { BADGE } else { blend(PANEL_BG, HEADER_BG, 0.32) },
+        );
+        draw_centered_text(
+            img,
+            &assets.narrow,
+            16.0,
+            if is_selected { PANEL_BG } else { VALUE },
+            chip,
+            chip.y + 1,
+            &format!("{:02}", i + 1),
+            0.55,
+        );
+
+        let cell = layout.finger_cells[i as usize];
+        stroke_rect(img, cell.inner(1, 1), if is_selected { BADGE } else { blend(BORDER, VALUE, 0.25) }, 2);
+    }
 }
 
 fn draw_menu_overlay(
