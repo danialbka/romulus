@@ -1,7 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::Duration,
+    time::Instant,
 };
 
 use ab_glyph::FontArc;
@@ -16,6 +16,7 @@ use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 const DEFAULT_IMAGE: &str = "HEI1Ts9aIAETw1k.jpg";
 const BASE_W: u32 = 1197;
 const BASE_H: u32 = 907;
+const CLOCK_START_SECONDS: u32 = 2 * 3600 + 3 * 60 + 5;
 
 const BG: Rgba<u8> = Rgba([6, 9, 8, 255]);
 const PANEL_BG: Rgba<u8> = Rgba([6, 11, 10, 255]);
@@ -352,6 +353,7 @@ struct AppState {
     department: Department,
     badge_mode: BadgeMode,
     selected_print: usize,
+    clock_seconds: u32,
     has_interacted: bool,
 }
 
@@ -366,6 +368,7 @@ impl Default for AppState {
             department: Department::Farming,
             badge_mode: BadgeMode::AccessA,
             selected_print: 1,
+            clock_seconds: 0,
             has_interacted: false,
         }
     }
@@ -459,6 +462,7 @@ fn show_window(assets: &Assets, layout: &Layout, scale: f32) -> Result<()> {
             ..WindowOptions::default()
         },
     )?;
+    window.set_target_fps(60);
 
     let mut state = AppState::default();
     let mut frame = render_scene(assets, layout, &state, true)?;
@@ -466,9 +470,15 @@ fn show_window(assets: &Assets, layout: &Layout, scale: f32) -> Result<()> {
     let mut buffer = rgba_to_u32(&scaled);
     let mut last_size = (start_w, start_h);
     let mut mouse_was_down = false;
+    let clock_started = Instant::now();
 
     while window.is_open() && !window.is_key_down(Key::Q) {
         let mut dirty = false;
+        let next_clock_seconds = clock_started.elapsed().as_secs().min(u32::MAX as u64) as u32;
+        if next_clock_seconds != state.clock_seconds {
+            state.clock_seconds = next_clock_seconds;
+            dirty = true;
+        }
 
         if window.is_key_pressed(Key::Escape, KeyRepeat::No) {
             if state.open_menu.take().is_some() {
@@ -530,7 +540,6 @@ fn show_window(assets: &Assets, layout: &Layout, scale: f32) -> Result<()> {
         }
 
         window.update_with_buffer(&buffer, window_w, window_h)?;
-        std::thread::sleep(Duration::from_millis(16));
     }
 
     Ok(())
@@ -682,7 +691,8 @@ fn draw_status(
     draw_filled_rect_mut(img, Rect::at(inner.x as i32, inner.y as i32).of_size(inner.w, inner.h), badge_fill);
     draw_centered_text(img, &assets.narrow, 24.0, PANEL_BG, inner, inner.y + 6, state.badge_mode.glyph(), 0.62);
 
-    draw_text(img, &assets.narrow, 18.0, LABEL, layout.status_right.x + 22, layout.status_right.y + 14, "02:03:05");
+    let clock = format_clock_text(state.clock_seconds);
+    draw_text(img, &assets.narrow, 18.0, LABEL, layout.status_right.x + 22, layout.status_right.y + 14, &clock);
     draw_text(
         img,
         &assets.narrow,
@@ -1273,6 +1283,14 @@ fn blend(a: Rgba<u8>, b: Rgba<u8>, t: f32) -> Rgba<u8> {
     Rgba([mix(a[0], b[0]), mix(a[1], b[1]), mix(a[2], b[2]), 255])
 }
 
+fn format_clock_text(elapsed_seconds: u32) -> String {
+    let total = (CLOCK_START_SECONDS + elapsed_seconds) % (24 * 3600);
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1317,5 +1335,12 @@ mod tests {
         let hit = hit_test(&layout, &state, row.x + 4, row.y + 4);
 
         assert_eq!(hit, Some(HitTarget::MenuItem(entry.action)));
+    }
+
+    #[test]
+    fn clock_text_starts_from_reference_time_and_wraps() {
+        assert_eq!(format_clock_text(0), "02:03:05");
+        assert_eq!(format_clock_text(55), "02:04:00");
+        assert_eq!(format_clock_text(24 * 3600), "02:03:05");
     }
 }
