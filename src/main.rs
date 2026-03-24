@@ -46,7 +46,7 @@ const MIN_HEIGHT: u16 = 34;
 
 const DEFAULT_IMAGE: &str = "HEI1Ts9aIAETw1k.jpg";
 const DEFAULT_FONT: &str = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf";
-const SCREENSHOT_COLS: u16 = 168;
+const SCREENSHOT_COLS: u16 = 158;
 const SCREENSHOT_ROWS: u16 = 72;
 const CELL_WIDTH_PX: u32 = 12;
 const CELL_HEIGHT_PX: u32 = 20;
@@ -205,8 +205,8 @@ impl App {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
                 Constraint::Length(4),
+                Constraint::Length(6),
                 Constraint::Min(0),
             ])
             .split(inner);
@@ -222,28 +222,40 @@ impl App {
             .constraints([Constraint::Length(38), Constraint::Min(0)])
             .split(area);
 
+        let left_block = bar_block();
+        frame.render_widget(left_block.clone(), columns[0]);
+        let left_inner = left_block.inner(columns[0]).inner(Margin {
+            horizontal: 1,
+            vertical: 0,
+        });
+        let left_layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(4), Constraint::Min(0)])
+            .split(left_inner);
+
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    " W ",
-                    Style::default()
-                        .fg(VALUE)
-                        .bg(PANEL_BG)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    "WEYLAND-YUTANI CORP",
-                    Style::default()
-                        .fg(VALUE)
-                        .bg(HEADER_BG)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]))
-            .block(bar_block())
+            Paragraph::new(Line::styled(
+                "W",
+                Style::default()
+                    .fg(VALUE)
+                    .bg(PANEL_BG)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .style(Style::default().bg(PANEL_BG))
+            .alignment(Alignment::Center),
+            left_layout[0],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "WEYLAND-YUTANI CORP",
+                Style::default()
+                    .fg(VALUE)
+                    .bg(HEADER_BG)
+                    .add_modifier(Modifier::BOLD),
+            ))
             .style(Style::default().bg(HEADER_BG))
             .alignment(Alignment::Left),
-            columns[0],
+            left_layout[1],
         );
 
         frame.render_widget(
@@ -286,6 +298,12 @@ impl App {
         ]);
 
         frame.render_widget(Paragraph::new(meta).block(panel_block()), left[0]);
+        let badge_block = panel_block();
+        frame.render_widget(badge_block.clone(), left[1]);
+        let badge_inner = badge_block.inner(left[1]).inner(Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
         frame.render_widget(
             Paragraph::new(Line::styled(
                 "A",
@@ -294,10 +312,9 @@ impl App {
                     .bg(VALUE)
                     .add_modifier(Modifier::BOLD),
             ))
-                .block(panel_block())
-                .style(Style::default().bg(VALUE))
-                .alignment(Alignment::Center),
-            left[1],
+            .style(Style::default().bg(VALUE))
+            .alignment(Alignment::Center),
+            badge_inner,
         );
 
         let right = Text::from(vec![
