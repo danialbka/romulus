@@ -3,7 +3,7 @@ use std::{
     time::Instant,
 };
 
-use ab_glyph::FontArc;
+use ab_glyph::{Font, FontArc, GlyphId, ScaleFont};
 use anyhow::{Context, Result, bail};
 use image::{DynamicImage, GenericImageView, Rgba, RgbaImage, imageops::FilterType};
 use imageproc::{
@@ -22,9 +22,13 @@ const EMBEDDED_MONO_FONT: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/fonts/DejaVuSansMono-Bold.ttf"
 ));
-const EMBEDDED_NARROW_FONT: &[u8] = include_bytes!(concat!(
+const EMBEDDED_NARROW_BOLD_FONT: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/fonts/LiberationSansNarrow-Bold.ttf"
+));
+const EMBEDDED_NARROW_REGULAR_FONT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/LiberationSansNarrow-Regular.ttf"
 ));
 
 const BG: Rgba<u8> = Rgba([6, 9, 8, 255]);
@@ -208,7 +212,8 @@ impl Cli {
 struct Assets {
     source: DynamicImage,
     mono: FontArc,
-    narrow: FontArc,
+    narrow_bold: FontArc,
+    narrow_regular: FontArc,
 }
 
 impl Assets {
@@ -216,7 +221,8 @@ impl Assets {
         Ok(Self {
             source: load_source_image(image_path)?,
             mono: load_font_bytes(EMBEDDED_MONO_FONT, "bundled mono font")?,
-            narrow: load_font_bytes(EMBEDDED_NARROW_FONT, "bundled narrow font")?,
+            narrow_bold: load_font_bytes(EMBEDDED_NARROW_BOLD_FONT, "bundled narrow bold font")?,
+            narrow_regular: load_font_bytes(EMBEDDED_NARROW_REGULAR_FONT, "bundled narrow regular font")?,
         })
     }
 }
@@ -417,10 +423,10 @@ impl Layout {
         let step = finger.w / 5;
         let finger_cells = std::array::from_fn(|i| {
             PxRect::new(
-                finger.x + i as u32 * step + 4,
-                finger.y + 24,
-                step.saturating_sub(8),
-                finger.h.saturating_sub(30),
+                finger.x + i as u32 * step + 7,
+                finger.y + 30,
+                step.saturating_sub(14),
+                finger.h.saturating_sub(40),
             )
         });
         let relations_focus = PxRect::new(left_panel.x + 14, left_panel.bottom() - 84, left_panel.w - 28, 64);
@@ -517,14 +523,13 @@ fn show_window(assets: &Assets, layout: &Layout, static_frame: &RgbaImage, scale
         let (ww, hh) = window.get_size();
         let window_w = ww.max(1);
         let window_h = hh.max(1);
+        let viewport = fit_viewport(window_w, window_h);
         let hover = window
-            .get_mouse_pos(MouseMode::Clamp)
+            .get_mouse_pos(MouseMode::Pass)
             .map(|(mx, my)| {
-                let x = ((mx.max(0.0) / window_w as f32) * BASE_W as f32)
-                    .clamp(0.0, (BASE_W - 1) as f32) as u32;
-                let y = ((my.max(0.0) / window_h as f32) * BASE_H as f32)
-                    .clamp(0.0, (BASE_H - 1) as f32) as u32;
-                hit_test(layout, &state, x, y)
+                map_mouse_to_canvas(mx, my, viewport)
+                    .map(|(x, y)| hit_test(layout, &state, x, y))
+                    .flatten()
             })
             .flatten();
 
@@ -550,12 +555,7 @@ fn show_window(assets: &Assets, layout: &Layout, static_frame: &RgbaImage, scale
         }
 
         if needs_present || dirty || last_size != (window_w, window_h) {
-            let buffer = if window_w as u32 == BASE_W && window_h as u32 == BASE_H {
-                rgba_to_u32(&frame)
-            } else {
-                let scaled = resize_to_window(&frame, window_w as u32, window_h as u32);
-                rgba_to_u32(&scaled)
-            };
+            let buffer = present_buffer(&frame, window_w, window_h);
             last_size = (window_w, window_h);
             needs_present = false;
             window.update_with_buffer(&buffer, window_w, window_h)?;
@@ -625,25 +625,25 @@ fn draw_header_static(
     assets: &Assets,
     layout: &Layout,
 ) -> Result<()> {
-    let logo_area = PxRect::new(layout.header_left.x + 12, layout.header_left.y + 7, 50, 18);
+    let logo_area = PxRect::new(layout.header_left.x + 11, layout.header_left.y + 6, 56, 20);
     let logo = crop_norm(&assets.source, LOGO_CROP)?;
     overlay_fit(img, &logo, logo_area);
     draw_text(
         img,
-        &assets.narrow,
-        21.0,
+        &assets.narrow_bold,
+        22.0,
         VALUE,
-        layout.header_left.x + 70,
-        layout.header_left.y + 6,
+        layout.header_left.x + 71,
+        layout.header_left.y + 5,
         "WEYLAND-YUTANI CORP",
     );
     draw_centered_text(
         img,
-        &assets.narrow,
-        21.0,
+        &assets.narrow_bold,
+        22.0,
         VALUE,
         layout.header_center,
-        layout.header_center.y + 6,
+        layout.header_center.y + 5,
         "COLONY AFFAIRS DATABASE",
         0.58,
     );
@@ -666,10 +666,10 @@ fn draw_header_dynamic(img: &mut RgbaImage, layout: &Layout, state: &AppState, i
 }
 
 fn draw_status_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout) {
-    draw_text(img, &assets.narrow, 18.0, LABEL, layout.status_left.x + 18, layout.status_left.y + 14, "USER:");
+    draw_text(img, &assets.narrow_regular, 18.0, LABEL, layout.status_left.x + 18, layout.status_left.y + 14, "USER:");
     draw_text(
         img,
-        &assets.narrow,
+        &assets.narrow_bold,
         20.0,
         VALUE,
         layout.status_left.x + 139,
@@ -678,7 +678,7 @@ fn draw_status_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout) {
     );
     draw_text(
         img,
-        &assets.narrow,
+        &assets.narrow_regular,
         18.0,
         LABEL,
         layout.status_left.x + 18,
@@ -687,14 +687,22 @@ fn draw_status_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout) {
     );
     draw_text(
         img,
-        &assets.narrow,
+        &assets.narrow_bold,
         20.0,
         VALUE,
         layout.status_left.x + 139,
         layout.status_left.y + 35,
         "JACKSON'S STAR COLONY",
     );
-    draw_text(img, &assets.narrow, 18.0, LABEL, layout.status_right.x + 22, layout.status_right.y + 38, "LOG_ID");
+    draw_text(
+        img,
+        &assets.narrow_regular,
+        18.0,
+        LABEL,
+        layout.status_right.x + 22,
+        layout.status_right.y + 38,
+        "LOG_ID",
+    );
 }
 
 fn draw_status_dynamic(
@@ -704,24 +712,32 @@ fn draw_status_dynamic(
     state: &AppState,
     interactive: bool,
 ) {
-    let inner = PxRect::new(layout.badge.x + 11, layout.badge.y + 9, layout.badge.w - 22, layout.badge.h - 18);
+    let inner = PxRect::new(layout.badge.x + 13, layout.badge.y + 11, layout.badge.w - 26, layout.badge.h - 22);
     let badge_fill = if interactive && (state.hover == Some(HitTarget::Badge) || state.open_menu == Some(MenuKind::Badge)) {
         blend(BADGE, VALUE, 0.12)
     } else {
         BADGE
     };
     draw_filled_rect_mut(img, Rect::at(inner.x as i32, inner.y as i32).of_size(inner.w, inner.h), badge_fill);
-    draw_centered_text(img, &assets.narrow, 24.0, PANEL_BG, inner, inner.y + 6, state.badge_mode.glyph(), 0.62);
+    draw_centered_text(img, &assets.narrow_bold, 22.0, PANEL_BG, inner, inner.y + 5, state.badge_mode.glyph(), 0.62);
 
     let clock = format_clock_text(state.clock_seconds);
-    draw_text(img, &assets.narrow, 18.0, LABEL, layout.status_right.x + 22, layout.status_right.y + 14, &clock);
     draw_text(
         img,
-        &assets.narrow,
-        22.0,
+        &assets.narrow_regular,
+        18.0,
+        LABEL,
+        layout.status_right.x + 22,
+        layout.status_right.y + 14,
+        &clock,
+    );
+    draw_text(
+        img,
+        &assets.narrow_bold,
+        22.5,
         VALUE,
         layout.status_right.x + 188,
-        layout.status_right.y + 11,
+        layout.status_right.y + 10,
         if interactive && state.has_interacted {
             state.badge_mode.status_text()
         } else {
@@ -734,20 +750,28 @@ fn draw_status_dynamic(
             ViewMode::Biometrics => "BIO-METRIC",
             ViewMode::Relations => "RELATIONS",
         };
-        draw_text(img, &assets.narrow, 18.0, LABEL, layout.status_right.x + 102, layout.status_right.y + 38, detail);
+        draw_text(
+            img,
+            &assets.narrow_regular,
+            18.0,
+            LABEL,
+            layout.status_right.x + 102,
+            layout.status_right.y + 38,
+            detail,
+        );
     }
 }
 
 fn draw_left_panel_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout) {
     let area = layout.left_panel;
-    draw_text(img, &assets.narrow, 18.0, LABEL, area.x + 20, area.y + 34, "CITIZEN ID:");
+    draw_text(img, &assets.narrow_regular, 18.0, LABEL, area.x + 20, area.y + 34, "CITIZEN ID:");
     draw_right_text(
         img,
         &assets.mono,
-        28.0,
+        27.0,
         VALUE,
         area.right() - 20,
-        area.y + 18,
+        area.y + 20,
         "FWC25583",
         0.58,
     );
@@ -763,10 +787,10 @@ fn draw_left_panel_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout)
         ("Weight", "45 KG", area.y + 553),
     ];
     for (idx, (label, value, y)) in fields.into_iter().enumerate() {
-        draw_text(img, &assets.narrow, 18.0, LABEL, area.x + 20, y, &format!("{label}:"));
+        draw_text(img, &assets.narrow_regular, 18.0, LABEL, area.x + 20, y, &format!("{label}:"));
         draw_right_text(
             img,
-            &assets.narrow,
+            &assets.narrow_regular,
             20.0,
             VALUE,
             area.right() - 18,
@@ -783,7 +807,7 @@ fn draw_left_panel_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout)
 
     draw_text(
         img,
-        &assets.narrow,
+        &assets.narrow_regular,
         18.0,
         LABEL,
         area.x + 20,
@@ -792,7 +816,7 @@ fn draw_left_panel_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout)
     );
     draw_right_text(
         img,
-        &assets.narrow,
+        &assets.narrow_regular,
         20.0,
         VALUE,
         area.right() - 18,
@@ -804,7 +828,7 @@ fn draw_left_panel_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout)
 
     draw_text(
         img,
-        &assets.narrow,
+        &assets.narrow_regular,
         18.0,
         LABEL,
         area.x + 20,
@@ -813,7 +837,7 @@ fn draw_left_panel_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout)
     );
     draw_right_text(
         img,
-        &assets.narrow,
+        &assets.narrow_regular,
         20.0,
         VALUE,
         area.right() - 18,
@@ -823,7 +847,7 @@ fn draw_left_panel_static(img: &mut RgbaImage, assets: &Assets, layout: &Layout)
     );
     draw_right_text(
         img,
-        &assets.narrow,
+        &assets.narrow_regular,
         20.0,
         VALUE,
         area.right() - 18,
@@ -857,10 +881,10 @@ fn draw_left_panel_dynamic(
         Rect::at(dept_label.x as i32, dept_label.y as i32).of_size(dept_label.w, dept_label.h),
         LABEL,
     );
-    draw_text(img, &assets.narrow, 18.0, PANEL_BG, dept_label.x + 12, dept_label.y + 8, "DEPT.");
+    draw_text(img, &assets.narrow_regular, 18.0, PANEL_BG, dept_label.x + 12, dept_label.y + 8, "DEPT.");
     draw_text(
         img,
-        &assets.narrow,
+        &assets.narrow_bold,
         20.0,
         VALUE,
         layout.dept.x + 92,
@@ -886,7 +910,7 @@ fn draw_left_panel_dynamic(
         );
         draw_centered_text(
             img,
-            &assets.narrow,
+            &assets.narrow_bold,
             22.0,
             if is_selected { PANEL_BG } else { VALUE },
             box_rect,
@@ -933,11 +957,11 @@ fn draw_fingerprint_panel_static(
         let label_area = PxRect::new(x, labels_y, step, 18);
         draw_centered_text(
             img,
-            &assets.narrow,
-            16.0,
+            &assets.narrow_regular,
+            15.0,
             VALUE,
             label_area,
-            labels_y,
+            labels_y + 1,
             &format!("{:02}", i + 1),
             0.55,
         );
@@ -982,11 +1006,11 @@ fn draw_fingerprint_panel_dynamic(
         );
         draw_centered_text(
             img,
-            &assets.narrow,
-            16.0,
+            &assets.narrow_bold,
+            15.0,
             if is_selected { PANEL_BG } else { VALUE },
             chip,
-            chip.y + 1,
+            chip.y + 2,
             &format!("{:02}", i + 1),
             0.55,
         );
@@ -1007,7 +1031,7 @@ fn draw_menu_overlay(
     let shadow = PxRect::new(panel.x + 4, panel.y + 4, panel.w, panel.h);
     draw_filled_rect_mut(img, Rect::at(shadow.x as i32, shadow.y as i32).of_size(shadow.w, shadow.h), SHADOW);
     fill_stroke_rect(img, panel, MENU_BG, BORDER, 3);
-    draw_text(img, &assets.narrow, 17.0, VALUE, panel.x + 12, panel.y + 8, kind.title());
+    draw_text(img, &assets.narrow_bold, 17.0, VALUE, panel.x + 12, panel.y + 8, kind.title());
     draw_dashed_hline(img, panel.x + 10, panel.right() - 10, panel.y + 28, MUTED, 1, 8, 5);
 
     for (row, entry) in menu_item_rects(layout, kind) {
@@ -1022,8 +1046,17 @@ fn draw_menu_overlay(
             draw_filled_rect_mut(img, Rect::at(row.x as i32, row.y as i32).of_size(row.w, row.h), fill);
             stroke_rect(img, row, if hovered { BADGE } else { BORDER }, 1);
         }
-        draw_text(img, &assets.narrow, 19.0, VALUE, row.x + 10, row.y + 3, entry.label);
-        draw_right_text(img, &assets.narrow, 15.0, LABEL, row.right() - 8, row.y + 6, entry.detail, 0.50);
+        draw_text(img, &assets.narrow_regular, 19.0, VALUE, row.x + 10, row.y + 3, entry.label);
+        draw_right_text(
+            img,
+            &assets.narrow_regular,
+            15.0,
+            LABEL,
+            row.right() - 8,
+            row.y + 6,
+            entry.detail,
+            0.50,
+        );
     }
 }
 
@@ -1173,6 +1206,68 @@ fn resize_to_window(img: &RgbaImage, w: u32, h: u32) -> RgbaImage {
     image::imageops::resize(img, w.max(1), h.max(1), FilterType::Nearest)
 }
 
+#[derive(Clone, Copy)]
+struct Viewport {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+}
+
+fn fit_viewport(window_w: usize, window_h: usize) -> Viewport {
+    let scale = (window_w as f32 / BASE_W as f32)
+        .min(window_h as f32 / BASE_H as f32)
+        .max(0.0001);
+    let w = (BASE_W as f32 * scale).round().max(1.0) as usize;
+    let h = (BASE_H as f32 * scale).round().max(1.0) as usize;
+    Viewport {
+        x: (window_w.saturating_sub(w)) / 2,
+        y: (window_h.saturating_sub(h)) / 2,
+        w,
+        h,
+    }
+}
+
+fn map_mouse_to_canvas(mx: f32, my: f32, viewport: Viewport) -> Option<(u32, u32)> {
+    let vx = viewport.x as f32;
+    let vy = viewport.y as f32;
+    let vw = viewport.w as f32;
+    let vh = viewport.h as f32;
+    if mx < vx || my < vy || mx >= vx + vw || my >= vy + vh {
+        return None;
+    }
+
+    let x = (((mx - vx) / vw) * BASE_W as f32)
+        .floor()
+        .clamp(0.0, (BASE_W - 1) as f32) as u32;
+    let y = (((my - vy) / vh) * BASE_H as f32)
+        .floor()
+        .clamp(0.0, (BASE_H - 1) as f32) as u32;
+    Some((x, y))
+}
+
+fn present_buffer(frame: &RgbaImage, window_w: usize, window_h: usize) -> Vec<u32> {
+    if window_w as u32 == BASE_W && window_h as u32 == BASE_H {
+        return rgba_to_u32(frame);
+    }
+
+    let viewport = fit_viewport(window_w, window_h);
+    let scaled = resize_to_window(frame, viewport.w as u32, viewport.h as u32);
+    let scaled_u32 = rgba_to_u32(&scaled);
+    let bg = ((BG[0] as u32) << 16) | ((BG[1] as u32) << 8) | BG[2] as u32;
+    let mut buffer = vec![bg; window_w * window_h];
+
+    for row in 0..viewport.h {
+        let src_start = row * viewport.w;
+        let src_end = src_start + viewport.w;
+        let dst_start = (viewport.y + row) * window_w + viewport.x;
+        let dst_end = dst_start + viewport.w;
+        buffer[dst_start..dst_end].copy_from_slice(&scaled_u32[src_start..src_end]);
+    }
+
+    buffer
+}
+
 fn crop_norm(source: &DynamicImage, crop: CropRect) -> Result<DynamicImage> {
     let (w, h) = source.dimensions();
     let x = (w as f32 * crop.x).round() as u32;
@@ -1189,7 +1284,7 @@ fn crop_norm(source: &DynamicImage, crop: CropRect) -> Result<DynamicImage> {
 
 fn fingerprint_crop(index: usize) -> CropRect {
     let segment = PRINTS_SOURCE_CROP.w / 5.0;
-    let inset = segment * 0.08;
+    let inset = segment * 0.05;
     CropRect {
         x: PRINTS_SOURCE_CROP.x + segment * index as f32 + inset,
         y: PRINTS_SOURCE_CROP.y,
@@ -1253,7 +1348,7 @@ fn draw_centered_text(
     text: &str,
     factor: f32,
 ) {
-    let w = estimate_text_width(text, size, factor);
+    let w = estimate_text_width(font, text, size, factor);
     let x = area.x + area.w.saturating_sub(w) / 2;
     draw_text(img, font, size, color, x, y, text);
 }
@@ -1268,12 +1363,25 @@ fn draw_right_text(
     text: &str,
     factor: f32,
 ) {
-    let w = estimate_text_width(text, size, factor);
+    let w = estimate_text_width(font, text, size, factor);
     draw_text(img, font, size, color, right.saturating_sub(w), y, text);
 }
 
-fn estimate_text_width(text: &str, size: f32, factor: f32) -> u32 {
-    (text.chars().count() as f32 * size * factor).round().max(1.0) as u32
+fn estimate_text_width(font: &FontArc, text: &str, size: f32, _factor: f32) -> u32 {
+    let scaled = font.as_scaled(size);
+    let mut width = 0.0f32;
+    let mut previous: Option<GlyphId> = None;
+
+    for ch in text.chars() {
+        let glyph = scaled.glyph_id(ch);
+        if let Some(prev) = previous {
+            width += scaled.kern(prev, glyph);
+        }
+        width += scaled.h_advance(glyph);
+        previous = Some(glyph);
+    }
+
+    width.ceil().max(1.0) as u32
 }
 
 fn stroke_rect(img: &mut RgbaImage, rect: PxRect, color: Rgba<u8>, thickness: u32) {
