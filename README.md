@@ -112,6 +112,8 @@ So we optimized it by:
   - tracing-paper comparison harness
 - `src/bin/reference_probe.rs`
   - zoom/crop inspection tool
+- `scripts/spectral_xray.py`
+  - spectral/x-ray mismatch visualizer for aligned images
 
 ## Run
 
@@ -139,9 +141,30 @@ If no image path is provided, the app uses the bundled `HEI1Ts9aIAETw1k.jpg` ref
 
 - Click top headers to open menus
 - Click the badge, department field, gender boxes, and fingerprint cells
+- Click any dossier stat value to edit it
+- Drag over dossier text to select it
+- Type to replace the selected text
+- `Backspace` / `Delete` edit the selected field
+- `Left` / `Right` / `Home` / `End` move the caret
+- `Enter` / `Tab` move to the next editable field
 - `Tab` cycles the top tabs
 - `Esc` closes a menu, then exits
 - `Q` quits
+
+## WSL / Wayland note
+
+Some Wayland setups print:
+
+```text
+Failed to create server-side surface decoration: Missing
+```
+
+That warning comes from `minifb` and is usually harmless.  
+If you want to avoid it under WSL, run with X11 fallback:
+
+```bash
+env -u WAYLAND_DISPLAY cargo run
+```
 
 ## Tracing / verification
 
@@ -163,8 +186,64 @@ Useful outputs:
 - `custom_trace_out/trace-grid-cells.png`
 - `custom_trace_out/trace-grid-metrics.txt`
 
+## Reference inspection / tracing-paper tooling
+
+These tools are in the repo so other people can use the same matching workflow.
+
+### 1. Probe the source image
+
+Generate zoom/crop sheets from the bundled reference:
+
+```bash
+cargo run --bin reference_probe -- --out-dir probe_out --sheet probe-sheet.png
+```
+
+This is useful for studying the logo area, badge, portrait crop, fingerprints, and line spacing.
+
+### 2. Trace your renderer output against the reference
+
+```bash
+cargo run -- --screenshot custom-renderer-shot.png
+cargo run --bin tracing_grid -- --reference HEI1Ts9aIAETw1k.jpg --shot custom-renderer-shot.png --out-dir custom_trace_out
+```
+
+The tracing harness exports:
+
+- `trace-grid-reference.png`
+- `trace-grid-shot.png`
+- `trace-grid-blend.png`
+- `trace-grid-delta.png`
+- `trace-grid-edges.png`
+- `trace-grid-cells.png`
+- `trace-grid-compare.png`
+- `trace-grid-metrics.txt`
+
+### 3. Generate a spectral / x-ray mismatch view
+
+Once you already have aligned tracing outputs:
+
+```bash
+python3 scripts/spectral_xray.py \
+  --reference custom_trace_out/trace-grid-reference.png \
+  --shot custom_trace_out/trace-grid-shot.png \
+  --out-dir custom_trace_out
+```
+
+This exports:
+
+- `spectral-reference.png`
+- `spectral-shot.png`
+- `spectral-xray.png`
+- `signed-xray.png`
+- `spectral-xray-boxed.png`
+- `spectral-xray-compare.png`
+- `spectral-hotspots.txt`
+
+The x-ray view is meant for diagnosis only: it helps pinpoint exact mismatch zones, hot cells, and residual geometry/text offsets.
+
 ## Notes
 
 - Fonts needed by the renderer are bundled in `assets/fonts/`
 - Live window mode needs a desktop/GUI environment
 - Screenshot mode works in headless environments
+- Generated probe/trace artifacts are ignored by `.gitignore`
